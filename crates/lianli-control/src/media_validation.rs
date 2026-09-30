@@ -36,7 +36,10 @@ pub(crate) fn ensure_decodable_checked(
         let mut command = Command::new("/usr/bin/lianli-daemon");
         command
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
             .env("LC_ALL", "C.UTF-8")
             .env("container", "lianli-media-validation")
             .args(["check-media-decode", "--kind", kind]);

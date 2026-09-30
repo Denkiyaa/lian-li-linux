@@ -859,7 +859,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(existing_bridge(&path).is_err());
         fs::remove_file(&path).unwrap();
-        symlink("/bin/true", &path).unwrap();
+        symlink(crate::command::test_program("true"), &path).unwrap();
         assert!(existing_bridge(&path).is_err());
     }
 

@@ -91,7 +91,7 @@ fn software_video_validation_requires_a_decoded_frame_and_accepts_gif_and_h264()
     let source = root.path().join("source.png");
     image.save(&source).unwrap();
     let movie = root.path().join("movie.mkv");
-    let mut command = Command::new("/usr/bin/ffmpeg");
+    let mut command = Command::new("ffmpeg");
     command
         .args([
             "-hide_banner",

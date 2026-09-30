@@ -39,7 +39,7 @@ pub fn check_still(mut file: File, kind: AssetKind, extension: Option<&str>) -> 
 /// Execute this command in place of the isolated validation helper. Its stdin
 /// must remain the opened regular media file, with process limits already set.
 pub fn video_command() -> Command {
-    let mut command = Command::new("/usr/bin/ffmpeg");
+    let mut command = Command::new("ffmpeg");
     command.args([
         "-hide_banner",
         "-nostdin",
@@ -90,6 +90,18 @@ pub fn video_command() -> Command {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn video_validation_finds_ffmpeg_in_the_supplied_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("ffmpeg");
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'path fixture'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = video_command().env("PATH", root.path()).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"path fixture");
+    }
 
     #[test]
     fn still_validation_uses_the_descriptor_and_the_renderers_filename_format() {

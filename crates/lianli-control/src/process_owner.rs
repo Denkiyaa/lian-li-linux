@@ -60,18 +60,27 @@ pub(crate) fn verify_container_peer(
         "Container IPC peer does not match the host owner's namespace PID"
     );
     let path = format!("/proc/{}/ns/pid", owner.pid);
-    let output = route.output(
-        "/usr/bin/stat",
-        &["--dereference", "--format=%d:%i", "--", &path],
-    )?;
-    ensure!(
-        output.status.success(),
-        "Cannot verify the host owner's PID namespace: {}",
-        output.stderr.trim()
-    );
+    let identity = match route {
+        Route::Native => {
+            let metadata = std::fs::metadata(&path)?;
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        }
+        Route::Host { .. } => {
+            let output = route.output(
+                "/usr/bin/stat",
+                &["--dereference", "--format=%d:%i", "--", &path],
+            )?;
+            ensure!(
+                output.status.success(),
+                "Cannot verify the host owner's PID namespace: {}",
+                output.stderr.trim()
+            );
+            output.stdout.trim().to_owned()
+        }
+    };
     let local = std::fs::metadata(format!("/proc/{peer_pid}/ns/pid"))?;
     ensure!(
-        output.stdout.trim() == format!("{}:{}", local.dev(), local.ino()),
+        identity == format!("{}:{}", local.dev(), local.ino()),
         "Host owner and IPC peer belong to different PID namespaces"
     );
     let local_start = parse_start_time(

@@ -213,7 +213,10 @@ impl Account {
         command
             .args(args)
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
             .env("HOME", &self.home)
             .env("USER", &self.name)
             .env("LOGNAME", &self.name)
@@ -425,8 +428,9 @@ mod tests {
             name: "fixture".into(),
             home: "/fixture".into(),
         };
+        let cat = crate::command::test_program("cat");
         let command = account
-            .command("/usr/bin/cat", &[OsStr::new("/proc/self/status")])
+            .command(cat.to_str().unwrap(), &[OsStr::new("/proc/self/status")])
             .unwrap();
         let result = crate::command::run(command, std::time::Duration::from_secs(3)).unwrap();
         assert!(result.status.success());
@@ -451,7 +455,7 @@ mod tests {
         assert_eq!(actual, groups);
         let launcher = account
             .command_with_privilege_policy(
-                "/usr/bin/cat",
+                cat.to_str().unwrap(),
                 &[OsStr::new("/proc/self/status")],
                 false,
             )
@@ -469,12 +473,19 @@ mod tests {
         let inherited = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
         assert_eq!(launcher_status["NoNewPrivs"].trim(), inherited.to_string());
         assert!(account.box_command(&[OsStr::new("inspect-state")]).is_err());
-        let command = account.command("/usr/bin/env", &[]).unwrap();
+        let env = crate::command::test_program("env");
+        let command = account.command(env.to_str().unwrap(), &[]).unwrap();
         let expected = command.get_envs().count();
         let result = crate::command::run(command, std::time::Duration::from_secs(3)).unwrap();
         assert!(result.status.success());
         assert_eq!(result.stdout.lines().count(), expected);
         assert!(result.stdout.lines().any(|line| line == "HOME=/fixture"));
+        if let Ok(path) = std::env::var("PATH") {
+            assert!(result
+                .stdout
+                .lines()
+                .any(|line| line == format!("PATH={path}")));
+        }
     }
 
     #[test]

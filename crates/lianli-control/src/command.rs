@@ -8,6 +8,19 @@ use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 64 * 1024;
 
+#[cfg(test)]
+pub(crate) fn test_program(name: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH").expect("Tests require PATH"))
+        .map(|directory| directory.join(name))
+        .find(|path| {
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .unwrap_or_else(|| panic!("Tests require {name} in PATH"))
+}
+
 #[derive(Debug)]
 pub struct Output {
     pub status: ExitStatus,
@@ -242,12 +255,8 @@ mod tests {
             .write_all(b"{\"path\":\"space and $shell text\"}")
             .unwrap();
         input.rewind().unwrap();
-        let output = run_with_stdin(
-            Command::new("/bin/cat"),
-            input.into(),
-            Duration::from_secs(2),
-        )
-        .unwrap();
+        let output =
+            run_with_stdin(Command::new("cat"), input.into(), Duration::from_secs(2)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, "{\"path\":\"space and $shell text\"}");
     }
@@ -276,7 +285,7 @@ mod tests {
         input.write_all(&vec![b'x'; 70 * 1024]).unwrap();
         input.rewind().unwrap();
         let output = run_with_stdin_limit(
-            Command::new("/bin/cat"),
+            Command::new("cat"),
             input.try_clone().unwrap().into(),
             Duration::from_secs(2),
             128 * 1024,
@@ -285,7 +294,7 @@ mod tests {
         assert_eq!(output.stdout.len(), 70 * 1024);
         input.rewind().unwrap();
         assert!(run_with_stdin(
-            Command::new("/bin/cat"),
+            Command::new("cat"),
             input.try_clone().unwrap().into(),
             Duration::from_secs(2)
         )
