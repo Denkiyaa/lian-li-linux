@@ -15,7 +15,7 @@ import PropertiesPanel from "@/components/editor/PropertiesPanel.vue";
 import ColorPicker from "@/components/rgb/ColorPicker.vue";
 import MediaAccessNotice from "@/components/lcd/MediaAccessNotice.vue";
 import { screenPresets } from "@/constants/screen";
-import { enumerateSensorsAsOptions, inferSensorCategory } from "@/stores/sensorOptions";
+import { sourceConfigsAsOptions, inferSensorCategory } from "@/stores/sensorOptions";
 
 const config = useConfigStore();
 const lcd = useLcdStore();
@@ -29,7 +29,7 @@ const statusIsError = ref(false);
 
 const renderPreview = lcd.renderPreview();
 
-const sensorOptions = computed(() => enumerateSensorsAsOptions(config.sensors, true));
+const sensorOptions = computed(() => sourceConfigsAsOptions(config.sensors, true));
 
 const presetOptions = screenPresets.map((p) => ({ label: p.label, value: p.label }));
 

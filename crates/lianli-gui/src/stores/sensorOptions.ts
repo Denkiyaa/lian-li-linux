@@ -1,4 +1,4 @@
-import type { SensorInfo, SensorSourceConfig } from "@/types";
+import type { SensorInfo, SensorSource, SensorSourceConfig } from "@/types";
 
 export interface SelectOption {
   label: string;
@@ -30,14 +30,27 @@ export function enumerateSensorsAsOptions(
   return opts;
 }
 
-/** Build options from SensorSourceConfig[] (e.g. for AIO source dropdowns). */
 export function sourceConfigsAsOptions(
   sensors: SensorInfo[],
+  includeCommand: boolean = false,
 ): SelectOption[] {
-  return sensors.map((s) => ({
+  const options = sensors.map((s) => ({
     label: formatSensorLabel(s),
-    value: JSON.stringify(s.source),
+    value: JSON.stringify(sourceToConfig(s.source)),
   }));
+  if (includeCommand) options.push({ label: "Custom command", value: "command" });
+  return options;
+}
+
+export function sourceToConfig(source: SensorSource | SensorSourceConfig): SensorSourceConfig {
+  switch (source.type) {
+    case "network_rate":
+      return { type: source.direction === "rx" ? "network_rx" : "network_tx", iface: source.iface };
+    case "disk_rate":
+      return { type: source.direction === "read" ? "disk_read" : "disk_write", device: source.device };
+    default:
+      return source;
+  }
 }
 
 function formatSensorLabel(s: SensorInfo): string {
@@ -69,7 +82,7 @@ const UNIT_LABELS: Record<string, string> = {
 export function decodeOption(value: string): SensorSourceConfig | null {
   if (!value || value === "command") return null;
   try {
-    return JSON.parse(value) as SensorSourceConfig;
+    return sourceToConfig(JSON.parse(value));
   } catch {
     return null;
   }
@@ -82,7 +95,8 @@ export function optionForConfig(
 ): string {
   if (!cfg) return "";
   const json = JSON.stringify(cfg);
-  return sensors.some((s) => JSON.stringify(s.source) === json) ? json : "";
+  const sensor = sensors.find((s) => JSON.stringify(sourceToConfig(s.source)) === json);
+  return sensor ? JSON.stringify(sensor.source) : "";
 }
 
 export function inferSensorCategory(src: SensorSourceConfig): string | null {
