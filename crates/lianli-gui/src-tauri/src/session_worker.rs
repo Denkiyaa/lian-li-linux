@@ -10,8 +10,7 @@ pub fn start() {
     if let Err(error) = std::thread::Builder::new()
         .name("session-launch".into())
         .spawn(move || {
-            if executable == std::path::Path::new("/usr/bin/lianli-session")
-                && std::path::Path::new("/usr/lib/systemd/user/lianli-session.service").is_file()
+            if lianli_control::services::native_desktop_unit().is_some()
                 && matches!(
                     lianli_shared::installation::InstallationContext::detect(),
                     lianli_shared::installation::InstallationContext::Native

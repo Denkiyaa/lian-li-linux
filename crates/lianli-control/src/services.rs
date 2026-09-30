@@ -14,6 +14,8 @@ use std::time::Duration;
 
 mod desktop_startup;
 pub use desktop_startup::check_distrobox_desktop_startup;
+mod native_desktop;
+pub use native_desktop::{native_desktop_startup_installed, native_desktop_unit};
 
 const PROPERTIES: &str =
     "Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,FragmentPath,ControlGroup,InvocationID,KillMode,SendSIGKILL,KillSignal,RestartKillSignal,TimeoutStopFailureMode,ExecStopPre,ExecStop,ExecStopPost";

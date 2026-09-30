@@ -189,16 +189,7 @@ fn check_desktop_startup(context: &InstallationContext) -> InstallationFinding {
         return lianli_control::services::check_distrobox_desktop_startup(name);
     }
     let native = matches!(context, InstallationContext::Native);
-    let root = Path::new("/usr/lib/systemd/user");
-    let unit = fs::File::open(root.join("lianli-session.service")).and_then(|file| {
-        let mut contents = String::new();
-        file.take(4097).read_to_string(&mut contents)?;
-        Ok(contents)
-    });
-    let present = native
-        && unit.is_ok_and(|contents| contents.len() <= 4096 && contents.contains("--login-start"))
-        && fs::read_link(root.join("default.target.wants/lianli-session.service"))
-            .is_ok_and(|target| target == Path::new("../lianli-session.service"));
+    let present = native && lianli_control::services::native_desktop_startup_installed();
     InstallationFinding {
         code: "desktop.login_startup".into(),
         state: if present { CheckState::Passed } else { CheckState::Unavailable },

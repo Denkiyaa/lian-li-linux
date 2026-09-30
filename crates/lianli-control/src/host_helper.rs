@@ -18,33 +18,7 @@ pub fn installed() -> Result<PathBuf> {
 }
 
 fn verify_path(path: &Path, boundary: &Path, owner: u32) -> Result<PathBuf> {
-    fn chain(path: &Path, boundary: &Path, owner: u32) -> Result<()> {
-        ensure!(
-            path.starts_with(boundary),
-            "Host helper left its trusted directory"
-        );
-        for current in path
-            .ancestors()
-            .take_while(|value| value.starts_with(boundary))
-        {
-            let metadata = fs::symlink_metadata(current)?;
-            ensure!(
-                metadata.uid() == owner && (metadata.is_symlink() || metadata.mode() & 0o022 == 0),
-                "Host helper paths must be root-owned and not writable by other accounts"
-            );
-            if current != path {
-                ensure!(
-                    metadata.is_dir() || metadata.is_symlink(),
-                    "Host helper parent is not a directory"
-                );
-            }
-        }
-        Ok(())
-    }
-    chain(path, boundary, owner)?;
-    let resolved = fs::canonicalize(path)?;
-    let boundary = fs::canonicalize(boundary)?;
-    chain(&resolved, &boundary, owner)?;
+    let resolved = crate::protected_path::resolve(path, boundary, &[owner])?;
     let metadata = fs::symlink_metadata(&resolved)?;
     ensure!(
         metadata.is_file()

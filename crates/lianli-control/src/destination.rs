@@ -316,10 +316,16 @@ fn verify_drop_ins(scope: ServiceScope) -> Result<()> {
         "Too many service overrides to inspect"
     );
     for path in paths.data {
+        let owners = if scope == ServiceScope::User {
+            vec![0, unsafe { libc::geteuid() }]
+        } else {
+            vec![0]
+        };
+        let resolved = crate::protected_path::resolve(Path::new(&path), Path::new("/"), &owners)?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
+            .open(resolved)?;
         let metadata = file.metadata()?;
         ensure!(
             metadata.is_file()
@@ -342,6 +348,7 @@ fn verify_drop_ins(scope: ServiceScope) -> Result<()> {
 
 fn verify_override(text: &str) -> Result<()> {
     let mut service = false;
+    let mut install = false;
     for line in text
         .lines()
         .map(str::trim)
@@ -349,9 +356,19 @@ fn verify_override(text: &str) -> Result<()> {
     {
         if line.starts_with('[') {
             service = line == "[Service]";
+            install = line == "[Install]";
             continue;
         }
         let (key, value) = line.split_once('=').context("Invalid override directive")?;
+        if install && key.trim() == "WantedBy" {
+            ensure!(
+                value
+                    .split_whitespace()
+                    .all(|target| matches!(target, "default.target" | "multi-user.target")),
+                "Unsupported service installation target"
+            );
+            continue;
+        }
         if service
             && matches!(
                 key.trim(),
@@ -395,6 +412,9 @@ fn verify_override(text: &str) -> Result<()> {
             matches!(
                 name,
                 "LIANLI_ENABLE_HW_VIDEO"
+                    | "PATH"
+                    | "LOCALE_ARCHIVE"
+                    | "TZDIR"
                     | "RUST_LOG"
                     | "DISPLAY"
                     | "WAYLAND_DISPLAY"
@@ -680,10 +700,11 @@ fn verify_properties(properties: &HashMap<&str, &str>, scope: ServiceScope) -> R
 }
 
 fn verify_recipe(path: &Path, scope: ServiceScope) -> Result<()> {
+    let path = crate::protected_path::resolve(path, Path::new("/"), &[0])?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+        .open(&path)?;
     let metadata = file.metadata()?;
     ensure!(
         metadata.is_file()
@@ -700,10 +721,12 @@ fn verify_recipe(path: &Path, scope: ServiceScope) -> Result<()> {
 }
 
 pub(crate) fn verify_daemon_binary() -> Result<()> {
+    let path =
+        crate::protected_path::resolve(Path::new("/usr/bin/lianli-daemon"), Path::new("/"), &[0])?;
     let binary = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/usr/bin/lianli-daemon")
+        .open(&path)
         .context("Installed daemon is unavailable")?;
     let metadata = binary.metadata()?;
     ensure!(
@@ -713,7 +736,11 @@ pub(crate) fn verify_daemon_binary() -> Result<()> {
             && metadata.mode() & 0o111 != 0,
         "Install a protected root-owned daemon binary before automatic switching"
     );
-    let output = Route::Native.output("/usr/bin/lianli-daemon", &["capabilities"])?;
+    let output = Route::Native.output(
+        path.to_str()
+            .context("Installed daemon path is not UTF-8")?,
+        &["capabilities"],
+    )?;
     ensure!(output.status.success(), "Installed daemon cannot report its capabilities: {}. Update it and its runtime libraries before switching", output.stderr.trim());
     verify_build(
         &serde_json::from_str(&output.stdout)
@@ -985,6 +1012,7 @@ mod tests {
             "[Service]\nEnvironment=LIANLI_ENABLE_HW_VIDEO=1\n",
             "[Service]\nEnvironment=\"RUST_LOG=info\"\nEnvironment=WAYLAND_DISPLAY=wayland-1\n",
             "[Service]\nTimeoutStopFailureMode=abort\n",
+            "[Service]\nEnvironment=PATH=/nix/store/fixture/bin:/usr/bin\nEnvironment=LOCALE_ARCHIVE=/nix/store/locale\nEnvironment=TZDIR=/nix/store/zoneinfo\n[Install]\nWantedBy=default.target\n",
             "[Service]\nKillMode=control-group\nSendSIGKILL=yes\nKillSignal=SIGINT\nRestartKillSignal=SIGTERM\nFinalKillSignal=SIGABRT\nTimeoutStopSec=45s\nTimeoutAbortSec=10s\n",
         ] {
             verify_override(text).unwrap();
@@ -995,6 +1023,9 @@ mod tests {
             "[Service]\nEnvironment=LD_PRELOAD=/tmp/custom.so",
             "[Service]\nEnvironment=\"RUST_LOG=info\" HOME=/other",
             "[Service]\nEnvironment=\"",
+            "[Install]\nAlso=other.service\n",
+            "[Install]\nWantedBy=other.service\n",
+            "[Install]\nExecStart=/bin/false\n",
         ] {
             assert!(verify_override(text).is_err(), "{text}");
         }

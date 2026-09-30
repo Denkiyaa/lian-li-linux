@@ -33,6 +33,7 @@ pub mod native_switch;
 pub mod operation_job;
 mod ownership;
 mod process_owner;
+mod protected_path;
 mod recovery_trigger;
 pub mod reservation;
 pub mod runtime_health;
