@@ -9,10 +9,41 @@ pub(super) struct ResponseReader {
 
 impl ResponseReader {
     pub(super) fn new(timeout_ms: i32) -> Self {
+        Self::with_report_limit(timeout_ms, 64)
+    }
+
+    pub(super) fn with_report_limit(timeout_ms: i32, remaining_reports: usize) -> Self {
         Self {
             deadline: Instant::now() + Duration::from_millis(timeout_ms.max(1) as u64),
-            remaining_reports: 64,
+            remaining_reports,
         }
+    }
+
+    pub(super) fn expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    pub(super) fn read_into(
+        &mut self,
+        bytes: &mut [u8],
+        mut read: impl FnMut(&mut [u8], i32) -> Result<usize>,
+    ) -> Result<usize> {
+        ensure!(
+            !lianli_transport::usb::shutting_down(),
+            "AIO response read cancelled"
+        );
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "AIO response deadline expired");
+        ensure!(
+            self.remaining_reports > 0,
+            "AIO response report limit exceeded"
+        );
+        let n = read(bytes, remaining.as_millis().clamp(1, 100) as i32)?;
+        ensure!(n <= bytes.len(), "oversized AIO response");
+        if n > 0 {
+            self.remaining_reports -= 1;
+        }
+        Ok(n)
     }
 
     pub(super) fn read(
@@ -20,26 +51,12 @@ impl ResponseReader {
         mut read: impl FnMut(&mut [u8], i32) -> Result<usize>,
     ) -> Result<Vec<u8>> {
         loop {
-            ensure!(
-                !lianli_transport::usb::shutting_down(),
-                "AIO response read cancelled"
-            );
-            let remaining = self.deadline.saturating_duration_since(Instant::now());
-            ensure!(!remaining.is_zero(), "AIO response deadline expired");
-            ensure!(
-                self.remaining_reports > 0,
-                "AIO response report limit exceeded"
-            );
             let mut bytes = [0; A_PACKET_SIZE];
-            let n = read(&mut bytes, remaining.as_millis().clamp(1, 100) as i32)?;
+            let n = self.read_into(&mut bytes, &mut read)?;
             if n == 0 {
                 continue;
             }
-            self.remaining_reports -= 1;
-            ensure!(
-                (2..=bytes.len()).contains(&n),
-                "short or oversized AIO response"
-            );
+            ensure!(n >= 2, "short AIO response");
             return Ok(bytes[..n].to_vec());
         }
     }
@@ -88,6 +105,25 @@ mod tests {
             remaining_reports: 64,
         };
         assert!(reader.read(|_, _| panic!("read after deadline")).is_err());
+    }
+
+    #[test]
+    fn caller_buffer_and_scan_limit_are_preserved() {
+        let mut reader = ResponseReader::with_report_limit(1000, 2);
+        let mut bytes = [0; 1024];
+        for _ in 0..2 {
+            let size = reader
+                .read_into(&mut bytes, |bytes, timeout| {
+                    assert!((1..=100).contains(&timeout));
+                    bytes.fill(2);
+                    Ok(bytes.len())
+                })
+                .unwrap();
+            assert_eq!(size, 1024);
+        }
+        assert!(reader
+            .read_into(&mut bytes, |_, _| panic!("read past report limit"))
+            .is_err());
     }
 
     #[test]

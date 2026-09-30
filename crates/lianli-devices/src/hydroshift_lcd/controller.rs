@@ -177,6 +177,14 @@ fn try_parse_handshake(buf: &[u8]) -> Option<AioHandshake> {
     })
 }
 
+fn cache_handshake(handshake: &Mutex<Option<AioHandshake>>, report: &[u8]) {
+    if report.get(1) == Some(&CMD_HANDSHAKE) {
+        if let Some(hs) = try_parse_handshake(report) {
+            *handshake.lock() = Some(hs);
+        }
+    }
+}
+
 fn background_reader(
     device: SharedHid,
     handshake: Arc<Mutex<Option<AioHandshake>>>,
@@ -194,11 +202,7 @@ fn background_reader(
                 last_query = now;
             }
             let n = dev.read_timeout(&mut buf, 20).unwrap_or(0);
-            if n > 0 && buf[1] == CMD_HANDSHAKE {
-                if let Some(hs) = try_parse_handshake(&buf[..n]) {
-                    *handshake.lock() = Some(hs);
-                }
-            }
+            cache_handshake(&handshake, &buf[..n]);
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -404,7 +408,7 @@ impl HydroShiftLcdController {
         payload[2] = rotation;
         payload[7] = self.video_fps.load(Ordering::Relaxed);
 
-        Self::send_b_command_raw(dev, CMD_LCD_CONTROL, &payload)?;
+        self.send_b_command_raw(dev, CMD_LCD_CONTROL, &payload)?;
         debug!("LCD settings applied: brightness={brightness}, rotation={rotation}");
         Ok(())
     }
@@ -484,8 +488,8 @@ impl HydroShiftLcdController {
             if stop.load(Ordering::Relaxed) {
                 bail!("AIO LCD: availability check aborted (stop requested)");
             }
-            let n = dev
-                .read_timeout(&mut buf, READ_TIMEOUT_MS)
+            let n = self
+                .read_report(&mut *dev, &mut buf, READ_TIMEOUT_MS)
                 .context("AIO LCD: read LCD available response")?;
 
             if n == 0 {
@@ -526,7 +530,7 @@ impl HydroShiftLcdController {
                 warn!("AIO LCD: reset device aborted (stop requested)");
                 return false;
             }
-            let n = match dev.read_timeout(&mut buf, 1000) {
+            let n = match self.read_report(&mut *dev, &mut buf, 1000) {
                 Ok(n) => n,
                 Err(e) => {
                     warn!("AIO LCD: reset device read failed: {e}");
@@ -640,7 +644,7 @@ impl HydroShiftLcdController {
         let mut reader = super::responses::ResponseReader::new(timeout_ms);
         let version = loop {
             let response = reader.read(|buf, timeout| {
-                dev.read_timeout(buf, timeout)
+                self.read_report(&mut *dev, buf, timeout)
                     .context("AIO LCD: read firmware")
             })?;
             if response[1] == CMD_GET_FIRMWARE {
@@ -649,7 +653,7 @@ impl HydroShiftLcdController {
         };
         // The date follows the version; consume it within the same deadline.
         while let Ok(response) = reader.read(|buf, timeout| {
-            dev.read_timeout(buf, timeout)
+            self.read_report(&mut *dev, buf, timeout)
                 .context("AIO LCD: read firmware date")
         }) {
             if response[1] == CMD_GET_FIRMWARE {
@@ -671,16 +675,11 @@ impl HydroShiftLcdController {
         let mut reader = super::responses::ResponseReader::new(timeout_ms);
         loop {
             let response = reader.read(|buf, timeout| {
-                dev.read_timeout(buf, timeout)
+                self.read_report(&mut *dev, buf, timeout)
                     .context("AIO LCD: read A-response")
             })?;
             if response[1] == cmd {
                 return Ok(response);
-            }
-            if cmd != CMD_HANDSHAKE && response[1] == CMD_HANDSHAKE {
-                if let Some(hs) = try_parse_handshake(&response) {
-                    *self.last_handshake.lock() = Some(hs);
-                }
             }
         }
     }
@@ -692,7 +691,7 @@ impl HydroShiftLcdController {
         write_a_command_raw(&mut *dev, cmd, data)
     }
 
-    fn send_b_command_raw(dev: &mut dyn HidTransport, cmd: u8, data: &[u8]) -> Result<()> {
+    fn send_b_command_raw(&self, dev: &mut dyn HidTransport, cmd: u8, data: &[u8]) -> Result<()> {
         let total_size = data.len();
         let mut offset = 0;
         let mut packet_num: u32 = 0;
@@ -724,17 +723,14 @@ impl HydroShiftLcdController {
             }
         }
 
-        let mut buf = [0u8; B_PACKET_SIZE];
-        if let Err(e) = dev.read_timeout(&mut buf, READ_TIMEOUT_MS) {
-            debug!("AIO LCD: send_b_command ack: {e:#}");
-        }
+        self.read_ack(dev, "send_b_command", READ_TIMEOUT_MS);
         Ok(())
     }
 
     fn send_b_command(&self, cmd: u8, data: &[u8]) -> Result<()> {
         let mut dev = self.device.lock();
         self.check_reinit_locked(&mut *dev)?;
-        Self::send_b_command_raw(&mut *dev, cmd, data)?;
+        self.send_b_command_raw(&mut *dev, cmd, data)?;
         self.check_reinit_locked(&mut *dev)
     }
 
@@ -826,10 +822,35 @@ impl HydroShiftLcdController {
         self.check_reinit_locked(&mut *dev)
     }
 
+    fn read_report(
+        &self,
+        dev: &mut dyn HidTransport,
+        buf: &mut [u8],
+        timeout_ms: i32,
+    ) -> Result<usize, lianli_transport::TransportError> {
+        let n = dev.read_timeout(buf, timeout_ms)?;
+        // Status replies share the endpoint with LCD and control replies.
+        cache_handshake(&self.last_handshake, &buf[..n]);
+        Ok(n)
+    }
+
     fn read_ack(&self, dev: &mut dyn HidTransport, label: &str, timeout_ms: i32) {
+        let mut reader = super::responses::ResponseReader::with_report_limit(timeout_ms, 16);
         let mut buf = [0u8; B_PACKET_SIZE];
-        if let Err(e) = dev.read_timeout(&mut buf, timeout_ms) {
-            debug!("AIO LCD: {label} ack: {e:#}");
+        while !reader.expired() {
+            let result = reader.read_into(&mut buf, |bytes, timeout| {
+                self.read_report(dev, bytes, timeout).map_err(Into::into)
+            });
+            match result {
+                Ok(0) => continue,
+                Ok(n) if n >= 2 && buf[1] == CMD_HANDSHAKE => continue,
+                Ok(_) => return,
+                Err(_) if reader.expired() => return,
+                Err(e) => {
+                    debug!("AIO LCD: {label} ack: {e:#}");
+                    return;
+                }
+            }
         }
     }
 }
@@ -1086,8 +1107,262 @@ impl LcdDevice for Arc<HydroShiftLcdController> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_au_split, read_access_units};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::*;
+    use lianli_transport::TransportError;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct HidScript {
+        replies: VecDeque<Result<Vec<u8>, TransportError>>,
+        writes: Vec<Vec<u8>>,
+        reads: usize,
+    }
+
+    struct ScriptedHid(Arc<Mutex<HidScript>>);
+
+    impl HidTransport for ScriptedHid {
+        fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+            self.0.lock().writes.push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn read_timeout(&mut self, buf: &mut [u8], timeout: i32) -> Result<usize, TransportError> {
+            assert!(timeout > 0);
+            let mut script = self.0.lock();
+            script.reads += 1;
+            let reply = script.replies.pop_front().expect("unexpected HID read")?;
+            if reply.is_empty() {
+                drop(script);
+                std::thread::sleep(Duration::from_millis(timeout as u64));
+            }
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+
+        fn send_feature_report(&mut self, _: &[u8]) -> Result<usize, TransportError> {
+            panic!("unexpected feature write")
+        }
+
+        fn get_feature_report(&mut self, _: &mut [u8]) -> Result<usize, TransportError> {
+            panic!("unexpected feature read")
+        }
+
+        fn get_input_report(&mut self, _: &mut [u8]) -> Result<usize, TransportError> {
+            panic!("unexpected input read")
+        }
+
+        fn read_flush(&mut self) {
+            panic!("unexpected flush")
+        }
+    }
+
+    fn status_report() -> Vec<u8> {
+        vec![
+            REPORT_ID_A,
+            CMD_HANDSHAKE,
+            0,
+            0,
+            0,
+            7,
+            0x02,
+            0x58,
+            0x09,
+            0x60,
+            1,
+            37,
+            5,
+        ]
+    }
+
+    fn scripted_controller(
+        replies: Vec<Vec<u8>>,
+    ) -> (HydroShiftLcdController, Arc<Mutex<HidScript>>) {
+        let transport = Arc::new(Mutex::new(HidScript {
+            replies: replies.into_iter().map(Ok).collect(),
+            ..Default::default()
+        }));
+        let device: SharedHid = Arc::new(Mutex::new(Box::new(ScriptedHid(transport.clone()))));
+        let controller = HydroShiftLcdController::new(device, 0x7395).unwrap();
+        (controller, transport)
+    }
+
+    fn assert_coolant(controller: &HydroShiftLcdController) {
+        assert_eq!(controller.poll_coolant_temp(), Some(37.5));
+        let status = controller.last_handshake.lock().clone().unwrap();
+        assert_eq!((status.fan_rpm, status.pump_rpm), (600, 2400));
+    }
+
+    #[test]
+    fn frame_ack_preserves_status_and_consumes_the_following_reply() {
+        for (cmd, use_c) in [
+            (CMD_SEND_JPEG, false),
+            (CMD_SEND_H264, false),
+            (CMD_SEND_H264, true),
+        ] {
+            let (controller, transport) =
+                scripted_controller(vec![status_report(), vec![REPORT_ID_B, cmd], vec![0xff]]);
+            controller.use_c_command.store(use_c, Ordering::Relaxed);
+            if cmd == CMD_SEND_JPEG {
+                controller.send_jpeg(&[1, 2, 3]).unwrap();
+            } else {
+                controller.send_h264_frame(&[1, 2, 3]).unwrap();
+            }
+            assert_coolant(&controller);
+            let transport = transport.lock();
+            assert_eq!(transport.reads, 2);
+            assert_eq!(transport.replies.len(), 1);
+            assert_eq!(
+                transport.writes[0][0],
+                if use_c { REPORT_ID_C } else { REPORT_ID_B }
+            );
+        }
+    }
+
+    #[test]
+    fn lcd_settings_preserve_interleaved_status() {
+        let (controller, transport) =
+            scripted_controller(vec![status_report(), vec![REPORT_ID_B, CMD_LCD_CONTROL]]);
+        controller.apply_lcd_settings().unwrap();
+        assert_coolant(&controller);
+        assert_eq!(transport.lock().reads, 2);
+    }
+
+    #[test]
+    fn availability_and_reset_preserve_interleaved_status() {
+        let mut available = vec![0; B_HEADER_LEN + 1];
+        available[0] = REPORT_ID_B;
+        available[1] = CMD_LCD_AVAILABLE;
+        available[10] = 1;
+        let (controller, _) = scripted_controller(vec![status_report(), available]);
+        assert!(controller
+            .is_lcd_available(&AtomicBool::new(false))
+            .unwrap());
+        assert_coolant(&controller);
+
+        let (controller, _) = scripted_controller(vec![
+            status_report(),
+            vec![REPORT_ID_A, CMD_RESET_DEVICE, 0, 0, 0, 1, 1],
+        ]);
+        assert!(controller.reset_device(&AtomicBool::new(false)));
+        assert_coolant(&controller);
+    }
+
+    #[test]
+    fn firmware_version_and_date_reads_preserve_status() {
+        for status_before_version in [true, false] {
+            let version = vec![REPORT_ID_A, CMD_GET_FIRMWARE, 0, 0, 0, 3, b'1', b'.', b'6'];
+            let date = vec![REPORT_ID_A, CMD_GET_FIRMWARE, 0, 0, 0, 1, b'x'];
+            let replies = if status_before_version {
+                vec![status_report(), version, date]
+            } else {
+                vec![version, status_report(), date]
+            };
+            let (controller, _) = scripted_controller(replies);
+            assert_eq!(controller.read_firmware_internal(1000).unwrap(), "1.6");
+            assert_coolant(&controller);
+        }
+    }
+
+    #[test]
+    fn a_command_preserves_status_while_waiting_for_its_response() {
+        let response = vec![REPORT_ID_A, CMD_SET_FAN_PWM];
+        let (controller, _) = scripted_controller(vec![status_report(), response.clone()]);
+        assert_eq!(
+            controller
+                .send_a_command(CMD_SET_FAN_PWM, &[0, 30], 1000)
+                .unwrap(),
+            response
+        );
+        assert_coolant(&controller);
+    }
+
+    #[test]
+    fn malformed_status_does_not_refresh_cached_temperature() {
+        let (controller, _) = scripted_controller(vec![]);
+        cache_handshake(&controller.last_handshake, &status_report());
+        let observed_at = controller
+            .last_handshake
+            .lock()
+            .as_ref()
+            .unwrap()
+            .observed_at;
+        let mut truncated = status_report();
+        truncated.pop();
+        for report in [vec![], vec![REPORT_ID_A], truncated] {
+            cache_handshake(&controller.last_handshake, &report);
+            assert_eq!(
+                controller
+                    .last_handshake
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .observed_at,
+                observed_at
+            );
+        }
+    }
+
+    #[test]
+    fn ack_waits_through_empty_slices_for_delayed_reply() {
+        let (controller, transport) = scripted_controller(vec![
+            vec![],
+            status_report(),
+            vec![],
+            vec![REPORT_ID_B, CMD_LCD_CONTROL],
+        ]);
+        controller.read_ack(&mut **controller.device.lock(), "test", READ_TIMEOUT_MS);
+        assert!(transport.lock().replies.is_empty());
+        assert_coolant(&controller);
+    }
+
+    #[test]
+    fn ack_empty_reads_stop_at_the_deadline() {
+        let (controller, transport) = scripted_controller(vec![vec![]; 8]);
+        let started = Instant::now();
+        controller.read_ack(&mut **controller.device.lock(), "test", 120);
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!((2..=3).contains(&transport.lock().reads));
+    }
+
+    #[test]
+    fn ack_error_returns_without_extra_reads() {
+        let (controller, _) = scripted_controller(vec![]);
+        let script = Arc::new(Mutex::new(HidScript {
+            replies: VecDeque::from([
+                Ok(status_report()),
+                Err(TransportError::Other("test failure".into())),
+            ]),
+            ..Default::default()
+        }));
+        let mut transport = ScriptedHid(script.clone());
+        controller.read_ack(&mut transport, "test", ACK_TIMEOUT_MS);
+        assert_eq!(script.lock().reads, 2);
+        assert_coolant(&controller);
+    }
+
+    #[test]
+    fn ack_scan_accepts_full_b_reports_and_preserves_short_reply_behavior() {
+        for reply in [vec![REPORT_ID_B], vec![REPORT_ID_B; B_PACKET_SIZE]] {
+            let (controller, transport) = scripted_controller(vec![status_report(), reply]);
+            controller.read_ack(&mut **controller.device.lock(), "test", ACK_TIMEOUT_MS);
+            assert_eq!(transport.lock().reads, 2);
+            assert_coolant(&controller);
+        }
+    }
+
+    #[test]
+    fn handshake_only_ack_scan_has_a_report_limit() {
+        let (controller, _) = scripted_controller(vec![]);
+        let script = Arc::new(Mutex::new(HidScript {
+            replies: (0..17).map(|_| Ok(status_report())).collect(),
+            ..Default::default()
+        }));
+        let mut transport = ScriptedHid(script.clone());
+        controller.read_ack(&mut transport, "test", 1000);
+        assert_eq!(script.lock().reads, 16);
+        assert_eq!(script.lock().replies.len(), 1);
+    }
 
     #[test]
     fn truncated_handshake_cannot_supply_coolant_fields() {
