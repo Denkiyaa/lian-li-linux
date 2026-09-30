@@ -11,6 +11,7 @@ pub(super) const B_HEADER_LEN: usize = 11;
 pub(super) const B_MAX_PAYLOAD: usize = B_PACKET_SIZE - B_HEADER_LEN; // 1013
 pub(super) const C_PACKET_SIZE: usize = 512;
 pub(super) const C_MAX_PAYLOAD: usize = C_PACKET_SIZE - 11; // 501
+pub(super) const INPUT_REPORT_SIZE: usize = 512;
 
 pub(super) const READ_TIMEOUT_MS: i32 = 1000;
 pub(super) const INIT_READ_TIMEOUT_MS: i32 = 3000;

@@ -3,7 +3,7 @@ use super::protocol::{
     A_PACKET_SIZE, B_HEADER_LEN, B_MAX_PAYLOAD, B_PACKET_SIZE, CMD_GET_FIRMWARE, CMD_HANDSHAKE,
     CMD_LCD_AVAILABLE, CMD_LCD_CONTROL, CMD_RESET_DEVICE, CMD_SEND_H264, CMD_SEND_JPEG,
     CMD_SET_FAN_PWM, CMD_SET_PUMP_PWM, C_MAX_PAYLOAD, C_PACKET_SIZE, INIT_READ_TIMEOUT_MS,
-    READ_TIMEOUT_MS, REPORT_ID_A, REPORT_ID_B, REPORT_ID_C,
+    INPUT_REPORT_SIZE, READ_TIMEOUT_MS, REPORT_ID_A, REPORT_ID_B, REPORT_ID_C,
 };
 use super::{AioHandshake, AioLcdVariant, LcdControlMode, ScreenRotation};
 use crate::registry::SharedHid;
@@ -190,7 +190,7 @@ fn background_reader(
     handshake: Arc<Mutex<Option<AioHandshake>>>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut buf = [0u8; A_PACKET_SIZE];
+    let mut buf = [0u8; INPUT_REPORT_SIZE];
     let mut last_query = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -524,7 +524,7 @@ impl HydroShiftLcdController {
             return false;
         }
 
-        let mut buf = [0u8; A_PACKET_SIZE];
+        let mut buf = [0u8; INPUT_REPORT_SIZE];
         for _ in 0..MAX_ATTEMPTS {
             if stop.load(Ordering::Relaxed) {
                 warn!("AIO LCD: reset device aborted (stop requested)");
@@ -1261,6 +1261,29 @@ mod tests {
             assert_eq!(controller.read_firmware_internal(1000).unwrap(), "1.6");
             assert_coolant(&controller);
         }
+    }
+
+    #[test]
+    fn firmware_reads_accept_full_size_input_reports() {
+        let mut lcd_reply = vec![0; INPUT_REPORT_SIZE];
+        lcd_reply[..2].copy_from_slice(&[REPORT_ID_C, CMD_SEND_H264]);
+        let mut version = vec![REPORT_ID_A, CMD_GET_FIRMWARE, 0, 0, 0, 3, b'1', b'.', b'6'];
+        version.resize(INPUT_REPORT_SIZE, 0);
+        let date = vec![REPORT_ID_A, CMD_GET_FIRMWARE, 0, 0, 0, 1, b'x'];
+        let (controller, _) = scripted_controller(vec![lcd_reply, status_report(), version, date]);
+        assert_eq!(controller.read_firmware_internal(1000).unwrap(), "1.6");
+        assert_coolant(&controller);
+    }
+
+    #[test]
+    fn reset_accepts_full_size_input_reports() {
+        let mut status = status_report();
+        status.resize(INPUT_REPORT_SIZE, 0);
+        let mut response = vec![REPORT_ID_A, CMD_RESET_DEVICE, 0, 0, 0, 1, 1];
+        response.resize(INPUT_REPORT_SIZE, 0);
+        let (controller, _) = scripted_controller(vec![status, response]);
+        assert!(controller.reset_device(&AtomicBool::new(false)));
+        assert_coolant(&controller);
     }
 
     #[test]

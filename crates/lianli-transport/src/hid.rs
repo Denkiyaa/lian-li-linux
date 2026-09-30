@@ -12,7 +12,7 @@ use crate::error::TransportError;
 use crate::hid_trait::HidTransport;
 use rusb::{Device, DeviceHandle, GlobalContext};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Closure that produces a fresh [`RusbHid`] after a stale-handle event
@@ -34,12 +34,36 @@ pub struct RusbHid {
     /// All HID interfaces we hold for the lifetime of this transport, so the
     /// kernel can't re-bind hidraw and reject our writes.
     claimed: Vec<u8>,
+    interfaces_claimed: bool,
     ep_in: u8,
     ep_out: Option<u8>,
-    /// Optional self-healing reopener. When set, an I/O error triggers a
-    /// fresh open + retry.
     reopener: Option<RusbHidReopener>,
     reopen_count: std::sync::atomic::AtomicU64,
+    reopen_gate: ReopenGate,
+}
+
+#[derive(Default)]
+struct ReopenGate {
+    next_attempt: Option<Instant>,
+}
+
+impl ReopenGate {
+    fn begin(&mut self, now: Instant) -> bool {
+        if self.next_attempt.is_some_and(|next| now < next) {
+            return false;
+        }
+        self.next_attempt = Some(now + Duration::from_secs(5));
+        true
+    }
+}
+
+fn needs_reopen(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::Usb(
+            rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe | rusb::Error::Interrupted
+        )
+    )
 }
 
 impl RusbHid {
@@ -191,10 +215,12 @@ impl RusbHid {
             handle,
             iface: target_iface,
             claimed,
+            interfaces_claimed: true,
             ep_in,
             ep_out,
             reopener,
             reopen_count: std::sync::atomic::AtomicU64::new(0),
+            reopen_gate: ReopenGate::default(),
         })
     }
 
@@ -238,18 +264,29 @@ impl RusbHid {
         Ok(())
     }
 
-    // ----- reopen machinery ---------------------------------------------------
-
     fn try_reopen(&mut self) -> Result<(), TransportError> {
         let reopener = self
             .reopener
             .clone()
             .ok_or_else(|| TransportError::Other("no reopener configured".into()))?;
-        let replacement = reopener().map_err(|e| TransportError::Other(format!("reopen: {e}")))?;
+        self.interfaces_claimed = false;
+        for &iface in self.claimed.iter().rev() {
+            match self.handle.release_interface(iface) {
+                Ok(()) | Err(rusb::Error::NotFound | rusb::Error::NoDevice) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut replacement =
+            reopener().map_err(|e| TransportError::Other(format!("reopen: {e}")))?;
+        replacement.reopener = Some(reopener);
+        replacement.reopen_gate.next_attempt = self.reopen_gate.next_attempt;
         let count = self
             .reopen_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
+        // The replacement owns the interface now; dropping the old handle
+        // must not reattach its kernel driver.
+        self.claimed.clear();
         *self = replacement;
         self.reopen_count
             .store(count, std::sync::atomic::Ordering::SeqCst);
@@ -260,8 +297,13 @@ impl RusbHid {
         self.reopen_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Run `op` against the inner handle. If it fails and a reopener is
-    /// configured, reopen once and retry.
+    fn handle(&self) -> Result<&DeviceHandle<GlobalContext>, TransportError> {
+        if !self.interfaces_claimed {
+            return Err(rusb::Error::NoDevice.into());
+        }
+        Ok(&self.handle)
+    }
+
     fn with_reopen<T>(
         &mut self,
         mut op: impl FnMut(&Self) -> Result<T, TransportError>,
@@ -269,11 +311,14 @@ impl RusbHid {
     ) -> Result<T, TransportError> {
         match op(self) {
             Ok(v) => Ok(v),
-            Err(e) if self.reopener.is_some() => {
+            Err(e) if self.reopener.is_some() && needs_reopen(&e) => {
                 // Failures are expected once shutdown starts, since new
                 // transfers are refused. Do not warn or attempt a reopen.
                 if crate::usb::shutting_down() {
                     debug!("RusbHid {label} failed ({e}) while shutting down, not reopening");
+                    return Err(e);
+                }
+                if !self.reopen_gate.begin(Instant::now()) {
                     return Err(e);
                 }
                 warn!("RusbHid {label} failed ({e}); attempting reopen");
@@ -285,14 +330,12 @@ impl RusbHid {
         }
     }
 
-    // ----- HID report API -----------------------------------------------------
-
     pub fn send_feature_report(&mut self, data: &[u8]) -> Result<usize, TransportError> {
         self.with_reopen(
             |s| {
                 let report_id = data.first().copied().unwrap_or(0) as u16;
                 let w_value = (0x03u16 << 8) | report_id;
-                s.handle
+                s.handle()?
                     .write_control(
                         0x21,
                         0x09,
@@ -312,7 +355,7 @@ impl RusbHid {
             |s| {
                 let report_id = buf.first().copied().unwrap_or(0) as u16;
                 let w_value = (0x03u16 << 8) | report_id;
-                s.handle
+                s.handle()?
                     .read_control(
                         0xA1,
                         0x01,
@@ -332,7 +375,7 @@ impl RusbHid {
             |s| {
                 let report_id = buf.first().copied().unwrap_or(0) as u16;
                 let w_value = (0x01u16 << 8) | report_id;
-                s.handle
+                s.handle()?
                     .read_control(
                         0xA1,
                         0x01,
@@ -361,7 +404,7 @@ impl RusbHid {
             ));
         }
         if let Some(ep_out) = self.ep_out {
-            self.handle
+            self.handle()?
                 .write_interrupt(ep_out, data, timeout)
                 .map_err(TransportError::from)
         } else {
@@ -370,7 +413,7 @@ impl RusbHid {
             let report_id = data.first().copied().unwrap_or(0) as u16;
             let report_type: u16 = 0x02;
             let w_value = (report_type << 8) | report_id;
-            self.handle
+            self.handle()?
                 .write_control(0x21, 0x09, w_value, self.iface as u16, data, timeout)
                 .map_err(TransportError::from)
         }
@@ -395,7 +438,7 @@ impl RusbHid {
                 } else {
                     Duration::from_millis(timeout_ms as u64)
                 };
-                match s.handle.read_interrupt(s.ep_in, buf, timeout) {
+                match s.handle()?.read_interrupt(s.ep_in, buf, timeout) {
                     Ok(n) => Ok(n),
                     Err(rusb::Error::Timeout) => Ok(0),
                     Err(e) => Err(TransportError::from(e)),
@@ -407,14 +450,28 @@ impl RusbHid {
 
     /// Drain any stale data from the device read buffer.
     pub fn read_flush(&mut self) {
-        let mut buf = [0u8; 64];
-        loop {
-            // Direct read (no reopen) since this is best-effort cleanup.
-            let timeout = Duration::from_millis(5);
-            match self.handle.read_interrupt(self.ep_in, &mut buf, timeout) {
-                Ok(n) if n > 0 => continue,
-                _ => break,
-            }
+        let Ok(handle) = self.handle() else {
+            return;
+        };
+        drain_reports(|buf, timeout| handle.read_interrupt(self.ep_in, buf, timeout));
+    }
+}
+
+fn drain_reports(mut read: impl FnMut(&mut [u8], Duration) -> Result<usize, rusb::Error>) {
+    let mut buf = [0u8; 1024];
+    let deadline = Instant::now() + Duration::from_millis(100);
+    for _ in 0..64 {
+        let timeout_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(5) as u64;
+        if timeout_ms == 0 {
+            break;
+        }
+        let timeout = Duration::from_millis(timeout_ms);
+        match read(&mut buf, timeout) {
+            Ok(n) if n > 0 => continue,
+            _ => break,
         }
     }
 }
@@ -537,5 +594,72 @@ impl HidTransport for RusbHid {
 
     fn reopen_count(&self) -> u64 {
         RusbHid::reopen_count(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_and_configuration_errors_do_not_reopen_the_device() {
+        for error in [
+            rusb::Error::Overflow,
+            rusb::Error::Timeout,
+            rusb::Error::InvalidParam,
+            rusb::Error::Access,
+            rusb::Error::Busy,
+            rusb::Error::NotSupported,
+        ] {
+            assert!(!needs_reopen(&error.into()), "{error}");
+        }
+        assert!(!needs_reopen(&TransportError::Other(
+            "invalid report".into()
+        )));
+        for error in [
+            rusb::Error::NoDevice,
+            rusb::Error::Io,
+            rusb::Error::Pipe,
+            rusb::Error::Interrupted,
+        ] {
+            assert!(needs_reopen(&error.into()), "{error}");
+        }
+    }
+
+    #[test]
+    fn repeated_failures_wait_between_reopen_attempts() {
+        let mut gate = ReopenGate::default();
+        let now = Instant::now();
+        assert!(gate.begin(now));
+        for offset in [0, 1, 20, 100, 4999] {
+            assert!(!gate.begin(now + Duration::from_millis(offset)));
+        }
+        assert!(gate.begin(now + Duration::from_secs(5)));
+        assert!(!gate.begin(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn flush_stops_even_when_reports_keep_arriving() {
+        let mut reads = 0;
+        drain_reports(|buf, timeout| {
+            assert!(buf.len() >= 512);
+            assert!(!timeout.is_zero());
+            assert!(timeout <= Duration::from_millis(5));
+            reads += 1;
+            Ok(512)
+        });
+        assert!((1..=64).contains(&reads));
+    }
+
+    #[test]
+    fn flush_stops_on_silence_or_disconnect() {
+        for result in [Ok(0), Err(rusb::Error::Timeout), Err(rusb::Error::NoDevice)] {
+            let mut reads = 0;
+            drain_reports(|_, _| {
+                reads += 1;
+                result
+            });
+            assert_eq!(reads, 1);
+        }
     }
 }

@@ -1,4 +1,4 @@
-use super::protocol::{A_HEADER_LEN, A_PACKET_SIZE};
+use super::protocol::{A_HEADER_LEN, INPUT_REPORT_SIZE};
 use anyhow::{ensure, Result};
 use std::time::{Duration, Instant};
 
@@ -51,7 +51,7 @@ impl ResponseReader {
         mut read: impl FnMut(&mut [u8], i32) -> Result<usize>,
     ) -> Result<Vec<u8>> {
         loop {
-            let mut bytes = [0; A_PACKET_SIZE];
+            let mut bytes = [0; INPUT_REPORT_SIZE];
             let n = self.read_into(&mut bytes, &mut read)?;
             if n == 0 {
                 continue;
