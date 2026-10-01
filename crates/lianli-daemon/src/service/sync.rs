@@ -219,7 +219,7 @@ impl ServiceManager {
 
     /// Update IPC telemetry and device list.
     pub(super) fn sync_ipc_telemetry(&self) {
-        let (streaming_active, media_runtime) = {
+        let (streaming_active, media_runtime, lcd_brightness) = {
             let targets = self.targets.lock();
             let runtime: HashMap<_, _> = targets
                 .iter()
@@ -230,7 +230,15 @@ impl ServiceManager {
                         .map(|_| (*index, target.media_status()))
                 })
                 .collect();
-            (!targets.is_empty(), runtime)
+            let brightness = targets
+                .values()
+                .filter_map(|target| {
+                    target
+                        .brightness_status()
+                        .map(|status| (target.device_identity.clone(), status.clone()))
+                })
+                .collect();
+            (!targets.is_empty(), runtime, brightness)
         };
 
         // OpenRGB server status
@@ -527,6 +535,7 @@ impl ServiceManager {
             }
             ipc_state.telemetry.desktop_streams = desktop_streams;
             ipc_state.telemetry.streaming_active = streaming_active;
+            ipc_state.telemetry.lcd_brightness = lcd_brightness;
             ipc_state.telemetry.openrgb_status = openrgb_status;
             ipc_state.telemetry.fan_rpms = fan_rpms;
             ipc_state.telemetry.coolant_temps = coolant_temps;

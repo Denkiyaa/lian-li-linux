@@ -1,9 +1,11 @@
 import { defineStore } from "pinia";
-import { computed, ref } from "vue";
+import { computed, onScopeDispose, ref, watch } from "vue";
 import { emit } from "@tauri-apps/api/event";
 import { useIpc } from "@/composables/useIpc";
 import { PIXEL_CLEANER_DURATION_OPTIONS } from "@/constants";
 import { useDebounce } from "@/composables/useDebounce";
+import { brightnessConfirmed, createBrightnessControl } from "@/utils/brightnessControl";
+import { useDevicesStore } from "@/stores/devices";
 import type { CatalogTemplate, LcdConfig, LcdTemplate, PixelCleanStatus } from "@/types";
 
 /** Broadcast when SetLcdTemplates changes the template list, so other open
@@ -64,6 +66,39 @@ function cleanerMatchesTarget(key: string, targetId?: string | null, cardIndex?:
  */
 export const useLcdStore = defineStore("lcd", () => {
   const ipc = useIpc();
+  const devices = useDevicesStore();
+  const brightnessErrors = ref<Record<string, string>>({});
+  const brightnessRequests = ref<Record<string, string>>({});
+  const brightnessControl = createBrightnessControl(
+    async (deviceId, brightness) => {
+      const requestId = crypto.randomUUID();
+      brightnessRequests.value[deviceId] = requestId;
+      const result = await ipc.request<{ applied: boolean }>("SetLcdBrightness", {
+        device_id: deviceId, brightness, request_id: requestId,
+      });
+      if (result.applied && brightnessRequests.value[deviceId] === requestId) {
+        delete brightnessErrors.value[deviceId];
+      }
+      return result;
+    },
+    (deviceId, error) => {
+      if (brightnessConfirmed(devices.telemetry.lcd_brightness?.[deviceId], brightnessRequests.value[deviceId])) return;
+      brightnessErrors.value[deviceId] =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Failed to set LCD brightness";
+    },
+  );
+  watch(() => devices.telemetry.lcd_brightness, (statuses) => {
+    for (const [deviceId, status] of Object.entries(statuses ?? {})) {
+      if (brightnessConfirmed(status, brightnessRequests.value[deviceId])) {
+        delete brightnessErrors.value[deviceId];
+      }
+    }
+  });
+  onScopeDispose(() => brightnessControl.dispose());
 
   // Last preview JPEG (base64) keyed by an arbitrary request id.
   const previewJpeg = ref<string>("");
@@ -90,7 +125,7 @@ export const useLcdStore = defineStore("lcd", () => {
     return ipc.request<CatalogInstallStatus | null>("GetCatalogInstallStatus");
   }
 
-  async function setBrightness(deviceId: string, brightness: number) {
+  function setBrightness(deviceId: string, brightness: number) {
     if (
       import.meta.env.DEV &&
       (deviceId.includes("mock") ||
@@ -98,7 +133,7 @@ export const useLcdStore = defineStore("lcd", () => {
     ) {
       return;
     }
-    await ipc.request("SetLcdBrightness", { device_id: deviceId, brightness });
+    brightnessControl.set(deviceId, brightness);
   }
 
   /**
@@ -332,6 +367,8 @@ export const useLcdStore = defineStore("lcd", () => {
     installTemplate,
     catalogInstallStatus,
     setBrightness,
+    brightnessErrors,
+    brightnessRequests,
     renderPreview,
     startPixelClean,
     preparingCleaner,

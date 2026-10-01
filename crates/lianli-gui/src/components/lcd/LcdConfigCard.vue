@@ -8,7 +8,8 @@ import { useDevicesStore } from "@/stores/devices";
 import { useLcdStore } from "@/stores/lcd";
 import { useIpc } from "@/composables/useIpc";
 import { useDebounce } from "@/composables/useDebounce";
-import { resolveLcdDevice } from "@/utils/lcdSelection";
+import { hasSavedLcdDevice, resolveLcdDevice } from "@/utils/lcdSelection";
+import { brightnessError } from "@/utils/brightnessControl";
 import { matchesMediaFile, pickMediaFile } from "@/utils/mediaPicker";
 import SensorGaugeEditor from "@/components/lcd/SensorGaugeEditor.vue";
 import ColorPicker from "@/components/rgb/ColorPicker.vue";
@@ -56,6 +57,9 @@ const selectedDeviceId = computed(
   () => deviceForEntry()?.device_id ?? "",
 );
 const selectedDevice = computed<DeviceInfo | undefined>(() => deviceForEntry());
+const brightnessConfigured = computed(() =>
+  hasSavedLcdDevice(selectedDeviceId.value, config.savedLcds, lcdDevices.value),
+);
 
 function onSelectDevice(id: string) {
   const d = lcdDevices.value.find((x) => x.device_id === id);
@@ -311,11 +315,18 @@ const brightness = computed({
   set: (v: number) => {
     props.entry.brightness = v;
     config.markDirty();
-    if (selectedDeviceId.value) {
-      void lcd.setBrightness(selectedDeviceId.value, v);
+    if (selectedDeviceId.value && brightnessConfigured.value) {
+      lcd.setBrightness(selectedDeviceId.value, v);
     }
   },
 });
+
+const currentBrightnessError = computed(() => brightnessError(
+  brightness.value,
+  devices.telemetry.lcd_brightness?.[selectedDeviceId.value],
+  lcd.brightnessErrors[selectedDeviceId.value],
+  lcd.brightnessRequests[selectedDeviceId.value],
+));
 
 const cleanerDurationOptions = PIXEL_CLEANER_DURATION_OPTIONS.map((opt) => ({
   label: opt.label,
@@ -540,6 +551,12 @@ async function handleStopClean() {
         suffix="%"
         @update:model-value="(v: number) => brightness = v"
       />
+      <n-alert v-if="currentBrightnessError" type="error">
+        Could not change screen brightness: {{ currentBrightnessError }}
+      </n-alert>
+      <p v-if="selectedDeviceId && !brightnessConfigured" class="hint">
+        Save this LCD configuration to apply brightness.
+      </p>
     </div>
     </div>
   </div>

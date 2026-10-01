@@ -100,6 +100,7 @@ export interface PixelCleanStatus {
 }
 
 export interface TelemetrySnapshot {
+  lcd_brightness?: Record<string, { request_id?: string | null; brightness: number; pending: boolean; error: string | null }>;
   desktop_streams?: DesktopStreamStatus[];
   media_preparation?: Record<string, {
     startup_recovery_required?: boolean;

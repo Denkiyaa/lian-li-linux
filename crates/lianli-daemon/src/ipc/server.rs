@@ -504,12 +504,36 @@ fn handle_request(
         IpcRequest::SetLcdBrightness {
             device_id,
             brightness,
+            request_id,
         } => {
-            let _ = tx.send(DaemonEvent::SetLcdBrightness {
-                device_id,
-                brightness,
-            });
-            IpcResponse::ok(serde_json::json!({ "applied": true }))
+            if brightness > 100 {
+                return IpcResponse::error("LCD brightness must be between 0 and 100");
+            }
+            if request_id.as_ref().is_some_and(|id| id.len() > 128) {
+                return IpcResponse::error("LCD brightness request ID is too long");
+            }
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+            if tx
+                .send(DaemonEvent::SetLcdBrightness {
+                    device_id,
+                    brightness,
+                    request_id,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                return IpcResponse::error("daemon service not running");
+            }
+            match reply_rx.recv_timeout(Duration::from_secs(4)) {
+                Ok(Ok(applied)) => IpcResponse::ok(serde_json::json!({
+                    "accepted": true, "applied": applied
+                })),
+                Ok(Err(error)) => IpcResponse::error(error),
+                Err(error) => {
+                    IpcResponse::error(format!("LCD brightness delivery not confirmed: {error}"))
+                }
+            }
         }
         IpcRequest::StartPixelClean {
             device_id,
@@ -807,6 +831,102 @@ mod tests {
             IpcResponse::Error { .. }
         ));
         assert!(!state.lock().config.as_ref().unwrap().hardware_video);
+    }
+
+    #[test]
+    fn brightness_response_uses_service_delivery_result() {
+        for result in [Ok(true), Ok(false), Err("LCD not found".to_owned())] {
+            let root = tempfile::tempdir().unwrap();
+            let state = Arc::new(Mutex::new(DaemonState::new(
+                root.path().join("config.json"),
+            )));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let expected = result.clone();
+            let worker = thread::spawn(move || {
+                let DaemonEvent::SetLcdBrightness {
+                    brightness,
+                    request_id,
+                    deadline,
+                    reply,
+                    ..
+                } = rx.recv().unwrap()
+                else {
+                    panic!("expected brightness request");
+                };
+                assert_eq!(brightness, 30);
+                assert_eq!(request_id.as_deref(), Some("test-brightness"));
+                assert!(deadline > Instant::now());
+                reply.send(result).unwrap();
+            });
+            let response = handle_request(
+                IpcRequest::SetLcdBrightness {
+                    device_id: "lcd".into(),
+                    brightness: 30,
+                    request_id: Some("test-brightness".into()),
+                },
+                &state,
+                tx.into(),
+            );
+            match (expected, response) {
+                (Ok(applied), IpcResponse::Ok { data }) => {
+                    assert_eq!(
+                        data,
+                        serde_json::json!({"accepted": true, "applied": applied})
+                    );
+                }
+                (Err(expected), IpcResponse::Error { message }) => assert_eq!(message, expected),
+                result => panic!("unexpected brightness response: {result:?}"),
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn brightness_rejects_invalid_values_and_a_stopped_service() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new(
+            root.path().join("config.json"),
+        )));
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(matches!(
+            handle_request(
+                IpcRequest::SetLcdBrightness {
+                    device_id: "lcd".into(),
+                    brightness: 101,
+                    request_id: None,
+                },
+                &state,
+                tx.clone().into()
+            ),
+            IpcResponse::Error { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            handle_request(
+                IpcRequest::SetLcdBrightness {
+                    device_id: "lcd".into(),
+                    brightness: 30,
+                    request_id: Some("x".repeat(129)),
+                },
+                &state,
+                tx.clone().into()
+            ),
+            IpcResponse::Error { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(matches!(
+            handle_request(
+                IpcRequest::SetLcdBrightness {
+                    device_id: "lcd".into(),
+                    brightness: 30,
+                    request_id: None,
+                },
+                &state,
+                tx.into()
+            ),
+            IpcResponse::Error { .. }
+        ));
     }
 
     #[test]

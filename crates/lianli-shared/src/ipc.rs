@@ -217,6 +217,8 @@ pub enum IpcRequest {
     SetLcdBrightness {
         device_id: String,
         brightness: u8,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     PingDevice {
         device_id: String,
@@ -612,6 +614,8 @@ pub struct DesktopStreamStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
     #[serde(default)]
+    pub lcd_brightness: HashMap<String, LcdBrightnessStatus>,
+    #[serde(default)]
     pub desktop_streams: Vec<DesktopStreamStatus>,
     #[serde(default)]
     pub media_preparation: HashMap<usize, MediaPreparationStatus>,
@@ -629,9 +633,57 @@ pub struct TelemetrySnapshot {
     pub pixel_clean_statuses: HashMap<String, PixelCleanStatus>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LcdBrightnessStatus {
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub brightness: u8,
+    /// Waiting for driver submission, not confirmation from the panel.
+    pub pending: bool,
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod quantity_tests {
     use super::*;
+
+    #[test]
+    fn brightness_status_is_optional_for_older_daemons() {
+        let mut value = serde_json::to_value(TelemetrySnapshot::default()).unwrap();
+        value.as_object_mut().unwrap().remove("lcd_brightness");
+        let snapshot: TelemetrySnapshot = serde_json::from_value(value).unwrap();
+        assert!(snapshot.lcd_brightness.is_empty());
+        let failure = LcdBrightnessStatus {
+            request_id: Some("brightness-request".into()),
+            brightness: 30,
+            pending: false,
+            error: Some("USB write failed".into()),
+        };
+        let encoded = serde_json::to_value(failure).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "request_id": "brightness-request",
+                "brightness": 30, "pending": false, "error": "USB write failed"
+            })
+        );
+        let request: IpcRequest = serde_json::from_value(serde_json::json!({
+            "method": "SetLcdBrightness", "params": { "device_id": "lcd", "brightness": 30 }
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            IpcRequest::SetLcdBrightness {
+                request_id: None,
+                ..
+            }
+        ));
+        let status: LcdBrightnessStatus = serde_json::from_value(serde_json::json!({
+            "brightness": 30, "pending": false, "error": null
+        }))
+        .unwrap();
+        assert!(status.request_id.is_none());
+    }
 
     #[test]
     fn set_config_accepts_numeric_ene_port_keys_from_gui_and_wire() {

@@ -7,3 +7,7 @@ export function resolveLcdDevice(entry: LcdConfig, devices: DeviceInfo[]): Devic
   }
   return devices[entry.index ?? 0];
 }
+
+export function hasSavedLcdDevice(deviceId: string, saved: LcdConfig[], devices: DeviceInfo[]): boolean {
+  return saved.some((entry) => resolveLcdDevice(entry, devices)?.device_id === deviceId);
+}

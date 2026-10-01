@@ -47,6 +47,7 @@ export const useConfigStore = defineStore("config", () => {
   const ipc = useIpc();
 
   const config = reactive<AppConfig>(defaultConfig());
+  const savedLcds = ref<LcdConfig[]>([]);
   const dirty = ref(false);
   const loaded = ref(false);
 
@@ -63,6 +64,7 @@ export const useConfigStore = defineStore("config", () => {
 
   /** Replace the entire config object (used after a daemon reload). */
   function replace(next: AppConfig) {
+    savedLcds.value = next.lcds.map((entry) => ({ ...entry }));
     Object.assign(config, defaultConfig(), next);
     dirty.value = false;
     loaded.value = true;
@@ -204,6 +206,7 @@ export const useConfigStore = defineStore("config", () => {
 
   return {
     config,
+    savedLcds,
     dirty,
     loaded,
     rgbCaps,
