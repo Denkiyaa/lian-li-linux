@@ -10,6 +10,15 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
 
+fn fixed_colors(model: Ene6k77Model, mode: RgbMode) -> bool {
+    mode == RgbMode::Off
+        || (model == Ene6k77Model::AlV2Fan
+            && matches!(
+                mode,
+                RgbMode::Rainbow | RgbMode::RainbowMorph | RgbMode::MeteorRainbow
+            ))
+}
+
 fn resolve_effects(config: &RgbDeviceConfig, model: Ene6k77Model, fan_count: u8) -> Vec<RgbEffect> {
     let mut config = config.clone();
     config.expand_legacy_group_zone(model.max_fans_per_group());
@@ -273,7 +282,9 @@ impl RgbDevice for Ene6k77GroupDevice {
                         RgbEffectParameters {
                             mode,
                             min_colors: 0,
-                            max_colors: if per_fan_colors {
+                            max_colors: if fixed_colors(self.controller.model, mode) {
+                                0
+                            } else if per_fan_colors {
                                 self.controller.fan_quantity(self.group)
                             } else if matches!(
                                 mode,
@@ -334,13 +345,14 @@ impl RgbDevice for Ene6k77GroupDevice {
                 effect.scope
             );
             let limit = match effect.mode {
+                _ if fixed_colors(self.controller.model, effect.mode) => 0,
                 RgbMode::Static | RgbMode::Breathing => {
                     self.controller.model.max_fans_per_group() as usize
                 }
                 RgbMode::StaticColorful | RgbMode::BreathingColorful => 4,
                 _ => self.controller.model.palette_size(),
             };
-            if config.regions.is_none() || effect.mode == RgbMode::Off {
+            if config.regions.is_none() || limit == 0 {
                 effect.colors.truncate(limit);
             } else {
                 anyhow::ensure!(effect.colors.len() <= limit, "Too many ENE group colors");

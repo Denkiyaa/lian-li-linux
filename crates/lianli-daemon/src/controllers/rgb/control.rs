@@ -113,11 +113,19 @@ impl RgbController {
         anyhow::bail!("RGB device is unavailable or has an unsupported layout: {id}")
     }
 
-    pub fn cache_direct_batch(&mut self, updates: &HashMap<String, HashMap<u8, Vec<[u8; 3]>>>) {
-        for (id, zones) in updates {
-            for (&zone, colors) in zones {
-                self.last_direct.insert((id.clone(), zone), colors.clone());
-            }
+    pub fn cache_direct_zone(
+        &mut self,
+        id: &str,
+        device: &Arc<dyn RgbDevice>,
+        zone: u8,
+        colors: Vec<[u8; 3]>,
+    ) {
+        if self
+            .wired
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, device))
+        {
+            self.last_direct.insert((id.to_owned(), zone), colors);
         }
     }
 

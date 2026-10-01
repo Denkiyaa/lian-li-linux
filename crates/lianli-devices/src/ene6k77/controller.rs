@@ -966,6 +966,28 @@ mod tests {
                     .unwrap();
                 assert!(!meteor.per_fan_colors);
                 assert_eq!(meteor.max_colors as usize, model.palette_size());
+                let off = region
+                    .effects
+                    .iter()
+                    .find(|p| p.mode == RgbMode::Off)
+                    .unwrap();
+                assert_eq!(off.max_colors, 0);
+                assert!(!off.per_fan_colors);
+                for spec in &region.effects {
+                    if matches!(
+                        spec.mode,
+                        RgbMode::Rainbow | RgbMode::RainbowMorph | RgbMode::MeteorRainbow
+                    ) {
+                        assert_eq!(
+                            spec.max_colors as usize,
+                            if model == Ene6k77Model::AlV2Fan {
+                                0
+                            } else {
+                                model.palette_size()
+                            }
+                        );
+                    }
+                }
             }
         }
     }

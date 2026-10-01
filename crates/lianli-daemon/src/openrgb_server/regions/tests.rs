@@ -77,6 +77,71 @@ fn mode_packet(command: &Command, version: u32) -> Vec<u8> {
 }
 
 #[test]
+fn optional_palettes_start_editable_and_survive_mode_switches() {
+    let mut cap = capabilities(3);
+    for region in &mut cap.region_parameters {
+        for (mode, max_colors) in [
+            (RgbMode::Meteor, 6),
+            (RgbMode::StaticColorful, 4),
+            (RgbMode::Off, 0),
+        ] {
+            region.effects.retain(|spec| spec.mode != mode);
+            region.effects.push(RgbEffectParameters {
+                mode,
+                min_colors: 0,
+                max_colors,
+                per_fan_colors: false,
+                directions: Vec::new(),
+                supports_speed: mode == RgbMode::Meteor,
+            });
+        }
+    }
+    let buffer = Mutex::new(DirectColorBuffer::new());
+    for region in [None, Some(0), Some(1)] {
+        let mut group = RegionGroup::new(cap.clone(), &[]);
+        if let Command::Mode { mode, .. } = mode_command(&group, region, RgbMode::StaticColorful) {
+            assert_eq!(mode.colors.len(), 4);
+        }
+        let mut meteor = mode_command(&group, region, RgbMode::Meteor);
+        if let Command::Mode { mode, .. } = &mut meteor {
+            assert_eq!(mode.colors.len(), 6);
+            assert!(mode.colors.windows(2).all(|pair| pair[0] != pair[1]));
+            mode.colors = vec![[12, 34, 56], [78, 90, 123]];
+        }
+        group.apply(&meteor, region, &buffer).unwrap();
+        let off = mode_command(&group, region, RgbMode::Off);
+        if let Command::Mode { mode, .. } = &off {
+            assert_eq!(mode.color_mode, COLOR_MODE_NONE);
+            assert!(mode.colors.is_empty());
+        }
+        group.apply(&off, region, &buffer).unwrap();
+        let remembered = mode_command(&group, region, RgbMode::Meteor);
+        if let Command::Mode { mode, .. } = &remembered {
+            assert_eq!(mode.colors, [[12, 34, 56], [78, 90, 123]]);
+        }
+        group.apply(&remembered, region, &buffer).unwrap();
+        group
+            .apply(&Command::Colors(vec![[255; 3]; 6]), None, &buffer)
+            .unwrap();
+        let selected = region.unwrap_or(0);
+        let effects = group.effects(&[
+            group.regions[0].state.clone(),
+            group.regions[1].state.clone(),
+        ]);
+        assert_eq!(effects[selected].colors, [[12, 34, 56], [78, 90, 123]]);
+        let mut empty = mode_command(&group, region, RgbMode::Meteor);
+        if let Command::Mode { mode, .. } = &mut empty {
+            mode.colors.clear();
+        }
+        group.apply(&empty, region, &buffer).unwrap();
+        group.apply(&off, region, &buffer).unwrap();
+        if let Command::Mode { mode, .. } = mode_command(&group, region, RgbMode::Meteor) {
+            assert!(mode.colors.is_empty());
+        }
+    }
+}
+
+#[test]
 fn device_modes_follow_and_zone_overrides_preserve_the_other_region() {
     let mut group = group();
     group.regions[1].modes.swap(1, 2);

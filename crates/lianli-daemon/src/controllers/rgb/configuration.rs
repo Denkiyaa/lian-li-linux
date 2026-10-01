@@ -226,6 +226,43 @@ impl RgbController {
             .unwrap_or_default())
     }
 
+    pub fn saved_zone_effects(&self, id: &str) -> Vec<(u8, RgbEffect)> {
+        let Some(device) = self
+            .config
+            .as_ref()
+            .and_then(|config| config.devices.iter().find(|device| device.device_id == id))
+        else {
+            return Vec::new();
+        };
+        if let Some(preset) = device.active_preset.as_ref().and_then(|name| {
+            self.presets
+                .iter()
+                .find(|preset| &preset.name == name && preset.device_id == id)
+        }) {
+            return preset
+                .zones
+                .iter()
+                .filter_map(|zone| {
+                    let effect = if zone.colors.is_empty() {
+                        zone.effect.clone()?
+                    } else {
+                        RgbEffect {
+                            mode: RgbMode::Direct,
+                            colors: zone.colors.clone(),
+                            ..Default::default()
+                        }
+                    };
+                    Some((zone.zone, effect))
+                })
+                .collect();
+        }
+        device
+            .zones
+            .iter()
+            .map(|zone| (zone.zone_index, zone.effect.clone()))
+            .collect()
+    }
+
     fn configured_group_effects(
         &self,
         device: &lianli_shared::rgb::RgbDeviceConfig,

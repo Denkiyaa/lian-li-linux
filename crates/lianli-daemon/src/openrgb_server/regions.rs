@@ -72,7 +72,7 @@ pub(super) fn targets(
                 }
             }
         } else {
-            targets.push(Target::Legacy(Arc::new(cap.clone())));
+            targets.push(Target::Legacy(Arc::new(legacy::capabilities(cap))));
         }
     }
     targets
@@ -83,7 +83,34 @@ struct State {
     mode: usize,
     effect: RgbEffect,
     colors: Vec<[u8; 3]>,
+    palettes: Vec<Vec<[u8; 3]>>,
     follow: bool,
+}
+
+fn default_palettes(modes: &[RgbEffectParameters]) -> Vec<Vec<[u8; 3]>> {
+    const COLORS: [[u8; 3]; 6] = [
+        [255, 0, 0],
+        [255, 255, 0],
+        [0, 255, 0],
+        [0, 255, 255],
+        [0, 0, 255],
+        [255, 0, 255],
+    ];
+    modes
+        .iter()
+        .map(|mode| {
+            if mode.per_fan_colors {
+                Vec::new()
+            } else {
+                COLORS
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(mode.max_colors as usize)
+                    .collect()
+            }
+        })
+        .collect()
 }
 
 struct Region {
@@ -165,17 +192,20 @@ impl RegionGroup {
                         .unwrap_or([255; 3])
                 })
                 .collect();
+            let mut palettes = default_palettes(&modes);
+            palettes[mode] = effect.colors.clone();
             Region {
                 modes,
                 state: State {
                     mode,
                     effect,
                     colors,
+                    palettes,
                     follow: false,
                 },
             }
         });
-        let modes = regions[0]
+        let modes: Vec<_> = regions[0]
             .modes
             .iter()
             .filter(|mode| regions[1].modes.contains(mode))
@@ -189,6 +219,7 @@ impl RegionGroup {
                 ..Default::default()
             },
             colors: Vec::new(),
+            palettes: default_palettes(&modes),
             follow: false,
         };
         Self {
@@ -347,6 +378,7 @@ impl RegionGroup {
         } else {
             RgbScope::Outer
         };
+        state.palettes[state.mode] = state.effect.colors.clone();
         state.follow = true;
     }
 
@@ -460,7 +492,11 @@ fn mode_list(specs: &[RgbEffectParameters], state: &State) -> Vec<ModeData> {
                     .take(colors_max as usize)
                     .collect()
             } else {
-                Vec::new()
+                state.palettes[index]
+                    .iter()
+                    .copied()
+                    .take(colors_max as usize)
+                    .collect()
             };
             colors.resize(colors.len().max(colors_min as usize), [255; 3]);
             ModeData {
@@ -524,6 +560,7 @@ fn set_mode(
     spec.validate_values(mode.speed, mode.brightness, mode.colors.len(), 0)
         .map_err(anyhow::Error::msg)?;
     state.mode = index;
+    state.palettes[index] = mode.colors.clone();
     state.effect = RgbEffect {
         mode: spec.mode,
         scope: state.effect.scope,

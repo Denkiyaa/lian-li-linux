@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 mod clients;
@@ -78,6 +78,33 @@ fn read_packet_from(stream: &mut impl Read) -> anyhow::Result<(u32, u32, Vec<u8>
     stream.read_exact(&mut payload)?;
     Ok((dev_idx, pkt_id, payload))
 }
+fn read_client_packet(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    // Idle clients stay connected; shutdown closes the socket to wake this wait.
+    stream.set_read_timeout(None)?;
+    anyhow::ensure!(stream.peek(&mut [0u8; 1])? != 0, "SDK client disconnected");
+    struct PacketReader<'a> {
+        stream: &'a mut TcpStream,
+        deadline: Instant,
+    }
+    impl Read for PacketReader<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+            self.stream.read(bytes)
+        }
+    }
+    read_packet_from(&mut PacketReader {
+        stream,
+        deadline: Instant::now() + timeout,
+    })
+}
+
 // v3 adds brightness, v4 segments, v5 flags, and v6 independent zone modes.
 const SERVER_PROTOCOL_VERSION: u32 = 6;
 
@@ -211,11 +238,11 @@ fn run_server(
         let groups = regions::groups(&caps, &rgb, &Default::default(), regions_enabled);
         (caps, revision, observed, groups)
     };
-    let mut legacy_states = legacy::states(&caps, &Default::default());
+    let mut legacy_states = legacy::states(&caps, &Default::default(), &rgb.lock());
     let mut delivery_devices: std::collections::HashMap<_, _> = {
         let rgb = rgb.lock();
-        groups
-            .keys()
+        caps.iter()
+            .map(|cap| &cap.device_id)
             .filter_map(|id| rgb.delivery_device(id).map(|device| (id.clone(), device)))
             .collect()
     };
@@ -235,7 +262,7 @@ fn run_server(
                     .map(|cap| cap.device_id.clone())
                     .collect();
                 direct_buffer.lock().retain_devices(&retained);
-                legacy_states = legacy::states(&current, &legacy_states);
+                legacy_states = legacy::states(&current, &legacy_states, &rgb.lock());
                 groups = regions::groups(&current, &rgb.lock(), &groups, regions_enabled);
                 for (id, group) in &groups {
                     if !retained.contains(id) {
@@ -246,8 +273,8 @@ fn run_server(
             }
             let current_devices: std::collections::HashMap<_, _> = {
                 let rgb = rgb.lock();
-                groups
-                    .keys()
+                caps.iter()
+                    .map(|cap| &cap.device_id)
                     .filter_map(|id| rgb.delivery_device(id).map(|device| (id.clone(), device)))
                     .collect()
             };
@@ -265,6 +292,11 @@ fn run_server(
             for id in &changed {
                 if let Some(group) = groups.get(id) {
                     group.lock().queue_current(&direct_buffer);
+                } else if let Some(state) = legacy_states.get(id) {
+                    let mut rgb = rgb.lock();
+                    if let Err(error) = state.lock().replay(&mut rgb, &direct_buffer) {
+                        warn!(device = %id, %error, "OpenRGB session replay failed");
+                    }
                 }
             }
             direct_buffer.lock().invalidate_group_delivery(&changed);
@@ -286,7 +318,6 @@ fn run_server(
                 };
                 info!("OpenRGB client connected from {addr}");
                 stream.set_nonblocking(false).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
                 let rgb = Arc::clone(&rgb);
@@ -421,7 +452,7 @@ impl ClientHandler {
     }
 
     fn read_packet(&mut self) -> anyhow::Result<(u32, u32, Vec<u8>)> {
-        read_packet_from(&mut self.stream)
+        read_client_packet(&mut self.stream, Duration::from_secs(10))
     }
 
     fn send_packet(&mut self, dev_idx: u32, pkt_id: u32, payload: &[u8]) -> anyhow::Result<()> {
@@ -489,7 +520,7 @@ impl ClientHandler {
             self.caps()
                 .get(index as usize)
                 .cloned()
-                .map(|cap| Target::Legacy(Arc::new(cap)))
+                .map(|cap| Target::Legacy(Arc::new(legacy::capabilities(&cap))))
         }
     }
 
@@ -553,6 +584,7 @@ impl ClientHandler {
                     }
                     let mut state = state.lock();
                     state.commit_mode(next);
+                    state.queue_colors(&self.direct_buffer, None);
                     state.update(kind)
                 };
                 self.notifications
@@ -615,6 +647,7 @@ struct ControllerSerializer {
     protocol_version: u32,
 }
 
+#[derive(Clone)]
 struct ZoneModeData {
     active_mode: i32,
     modes: Vec<ModeData>,
@@ -712,7 +745,12 @@ impl ControllerSerializer {
         let mut led_idx = 0;
         for zone in &cap.zones {
             for i in 0..zone.led_count {
-                write_string(&mut buf, &format!("{} LED {}", zone.name, i));
+                let name = if !cap.supports_direct && zone.led_count == 1 {
+                    format!("{} colour", zone.name)
+                } else {
+                    format!("{} LED {}", zone.name, i)
+                };
+                write_string(&mut buf, &name);
                 if self.protocol_version < 6 {
                     buf.extend_from_slice(&(led_idx as u32).to_le_bytes());
                 }
@@ -828,7 +866,11 @@ impl ControllerSerializer {
             brightness_max: MAX_EFFECT_VALUE,
             speed,
             brightness,
-            direction: DIR_RIGHT,
+            direction: if flags & (MODE_FLAG_HAS_DIRECTION_LR | MODE_FLAG_HAS_DIRECTION_UD) != 0 {
+                DIR_RIGHT
+            } else {
+                0
+            },
             colors: vec![[255; 3]; colors_min as usize],
         }
     }

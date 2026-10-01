@@ -148,6 +148,7 @@ pub fn start_direct_color_writer(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         debug!("Direct color writer started");
+        let mut failed_zones = std::collections::HashSet::<(String, u8)>::new();
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -194,8 +195,8 @@ pub fn start_direct_color_writer(
                 let mut wireless = Vec::new();
                 let mut wired = Vec::new();
                 {
-                    let mut rgb = rgb.lock();
-                    rgb.cache_direct_batch(&updates);
+                    let rgb = rgb.lock();
+                    failed_zones.retain(|(id, _)| rgb.clone_wired_device(id).is_some());
                     for (device_id, zones) in &updates {
                         if rgb.software_controlled(device_id) {
                             wireless.push((device_id.clone(), zones.clone()));
@@ -223,8 +224,19 @@ pub fn start_direct_color_writer(
                         if stop_flag.load(Ordering::Relaxed) {
                             break;
                         }
-                        if let Err(e) = dev.set_direct_colors(zone, &colors) {
-                            debug!("Wired flush error for {device_id} zone {zone}: {e}");
+                        let key = (device_id.clone(), zone);
+                        match dev.set_direct_colors(zone, &colors) {
+                            Ok(()) => {
+                                rgb.lock().cache_direct_zone(&device_id, &dev, zone, colors);
+                                if failed_zones.remove(&key) {
+                                    tracing::info!(device = %device_id, zone, "OpenRGB zone writes recovered");
+                                }
+                            }
+                            Err(error) => {
+                                if failed_zones.insert(key) {
+                                    tracing::warn!(device = %device_id, zone, %error, "OpenRGB zone write failed; SDK state is only the requested setting");
+                                }
+                            }
                         }
                     }
                 }
