@@ -3,6 +3,23 @@
 Generated from git history by git-cliff (see .github/cliff.toml).
 Regenerate rather than editing by hand.
 
+## v1.1.5 — 2026-10-01
+
+### Features
+- **rgb**: Add optional AL V2 inner/outer zones to the OpenRGB bridge  ([#231](https://github.com/sgtaziz/lian-li-linux/pull/231))
+
+### Fixes
+- **hydroshift**: Preserve telemetry during LCD response reads  ([#230](https://github.com/sgtaziz/lian-li-linux/pull/230))
+- **gui**: Map network and disk sensor selections (fixes [#232](https://github.com/sgtaziz/lian-li-linux/issues/232))
+- **control**: Accept protected symlink installations (fixes [#229](https://github.com/sgtaziz/lian-li-linux/issues/229))
+- **media**: Resolve runtime tools through PATH (fixes [#228](https://github.com/sgtaziz/lian-li-linux/issues/228))
+- **hydroshift**: Correct input buffers and reopen recovery (refs #227)  (`607121d`)
+- **rgb**: Preserve OpenRGB sessions, zone modes and palettes  ([#234](https://github.com/sgtaziz/lian-li-linux/pull/234))
+- **lcd**: Preserve brightness delivery during video playback  ([#235](https://github.com/sgtaziz/lian-li-linux/pull/235))
+
+### Other changes
+- Fix wireless RX-slot recovery deadlock and two RGB rendering bugs  ([#233](https://github.com/sgtaziz/lian-li-linux/pull/233))
+
 ## v1.1.4 — 2026-09-25
 
 ### Fixes
