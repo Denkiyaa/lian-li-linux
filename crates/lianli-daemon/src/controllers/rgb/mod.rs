@@ -63,6 +63,8 @@ pub struct RgbController {
     capabilities_revision: Arc<AtomicU64>,
     delivery_generations: HashMap<String, u64>,
     mb_sync_state: HashMap<String, bool>,
+    // Unrelated config saves must preserve colours pushed by live RGB clients.
+    configured_direct_colors: HashMap<(String, u8), Vec<[u8; 3]>>,
 }
 
 impl RgbController {
@@ -94,6 +96,7 @@ impl RgbController {
             capabilities_revision: Arc::new(AtomicU64::new(0)),
             delivery_generations: HashMap::new(),
             mb_sync_state: HashMap::new(),
+            configured_direct_colors: HashMap::new(),
         };
         controller.refresh_wireless_devices();
         controller
@@ -355,6 +358,9 @@ impl RgbController {
         self.last_direct.retain(|(id, _), _| {
             self.wired.contains_key(id) || self.wireless_state.contains_key(id)
         });
+        self.configured_direct_colors.retain(|(id, _), _| {
+            self.wired.contains_key(id) || self.wireless_state.contains_key(id)
+        });
     }
 
     pub fn retain_wired(&mut self, present: &std::collections::HashSet<String>) {
@@ -380,6 +386,8 @@ impl RgbController {
                 self.rendered.remove(&id);
                 self.mb_sync_state.remove(&id);
                 self.last_direct.retain(|(device, _), _| device != &id);
+                self.configured_direct_colors
+                    .retain(|(device, _), _| device != &id);
             }
         }
     }
@@ -423,6 +431,9 @@ impl RgbController {
         self.uploads
             .retain(|id, _| self.wireless_state.contains_key(id));
         self.last_direct.retain(|(id, _), _| {
+            self.wired.contains_key(id) || self.wireless_state.contains_key(id)
+        });
+        self.configured_direct_colors.retain(|(id, _), _| {
             self.wired.contains_key(id) || self.wireless_state.contains_key(id)
         });
     }

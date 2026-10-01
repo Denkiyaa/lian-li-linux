@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A wireless device discovered via the RX GetDev command.
 /// Parsed from the 42-byte device record in the response.
@@ -170,6 +170,30 @@ pub(super) fn parse_device_record(data: &[u8], list_index: u8) -> Option<Discove
         return None;
     }
 
+    // Channel 0 is not a valid RF channel, so a record reporting it is a failed
+    // or partial read rather than device state. Reject it here, at the parse
+    // boundary, so that no downstream path can act on its other fields either.
+    //
+    // channel_correction_action() already guards against channel 0, which stops
+    // the daemon re-binding in response. But merge_sightings() has no such guard
+    // and feeds every record into commit_streak(addr_cand, (channel, rx_type)).
+    // These records arrive in bursts of five to eight carrying a consistent
+    // bogus rx, which clears DEBOUNCE_SIGHTINGS (3) and commits that value into
+    // published.rx_type. Every outgoing frame then addresses the device with it.
+    //
+    // Measured on an SL-INF Flex pair: published rx drifted 1 -> 40 -> 41 -> 42
+    // -> 67 under the daemon while valid slots are 1-13, and each drift
+    // coincided with the chain's fans stopping. The same hardware driven by
+    // L-Connect3 held rx=41 across 12,344 consecutive records with no dropouts.
+    if channel == 0 {
+        debug!(
+            "  Device record {list_index}: channel 0 ({:02x?}, rx={rx_type}) - \
+             failed or partial read, ignoring",
+            mac
+        );
+        return None;
+    }
+
     let mut master_mac = [0u8; 6];
     master_mac.copy_from_slice(&data[6..12]);
     // fan_num >= 10 flags SL-INF right-attach (chains right-to-left).
@@ -246,6 +270,14 @@ pub(super) fn parse_device_record(data: &[u8], list_index: u8) -> Option<Discove
 
 pub(super) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 const DEBOUNCE_SIGHTINGS: u32 = 3;
+
+/// Exclusive upper bound for RX slots. `get_rx_unused()` allocates from 1..14,
+/// so anything at or above this was never a slot this daemon handed out.
+pub(super) const RX_SLOT_LIMIT: u8 = 14;
+
+pub(super) fn is_valid_rx(rx: u8) -> bool {
+    rx != 0 && rx < RX_SLOT_LIMIT
+}
 pub(super) const ACK_FRESHNESS: Duration = Duration::from_secs(3);
 pub(super) const REBIND_FOREIGN_AFTER: Duration = Duration::from_secs(10);
 
@@ -333,6 +365,7 @@ pub(super) struct DeviceHealth {
     pub raw_seen: Instant,
     pub foreign_since: Option<Instant>,
     pub observed_master: [u8; 6],
+    pub confirmed_invalid_rx: Option<u8>,
     master_cand: Option<([u8; 6], u32)>,
     addr_cand: Option<((u8, u8), u32)>,
 }
@@ -383,10 +416,14 @@ impl DeviceHealth {
         ChannelCorrectionAction::Send
     }
 
-    pub(super) fn new(rec: DiscoveredDevice) -> Self {
+    pub(super) fn new(mut rec: DiscoveredDevice) -> Self {
+        if !is_valid_rx(rec.rx_type) {
+            rec.rx_type = 0;
+        }
         Self {
             channel_correction: ChannelCorrection::default(),
             observed_master: rec.master_mac,
+            confirmed_invalid_rx: None,
             published: rec,
             last_seen: Instant::now(),
             bind_intent: false,
@@ -612,6 +649,9 @@ fn merge_sightings(
         h.raw_seen = now;
         h.raw_master = rec.master_mac;
         h.raw_rx = rec.rx_type;
+        if is_valid_rx(rec.rx_type) {
+            h.confirmed_invalid_rx = None;
+        }
         h.raw_channel = rec.channel;
 
         let p = &mut h.published;
@@ -648,7 +688,18 @@ fn merge_sightings(
 
         if let Some((ch, rx)) = commit_streak(&mut h.addr_cand, (rec.channel, rec.rx_type)) {
             h.published.channel = ch;
-            h.published.rx_type = rx;
+            if is_valid_rx(rx) {
+                h.published.rx_type = rx;
+            } else {
+                if h.confirmed_invalid_rx.is_none() && (rx != 0 || intent) {
+                    warn!(
+                        "{} reported out-of-range rx={rx}; keeping rx={} pending recovery",
+                        rec.mac_str(),
+                        h.published.rx_type
+                    );
+                }
+                h.confirmed_invalid_rx = Some(rx);
+            }
         }
 
         if !h.bind_intent && !h.man_unbind && rec.master_mac == local {
@@ -741,6 +792,49 @@ fn rebuild_published_vec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_rx_drift_requires_debounce_and_recovers_without_losing_ownership() {
+        for initial_rx in [1, 41] {
+            let controller = super::super::controller::WirelessController::new();
+            let local = [9; 6];
+            let mac = [1; 6];
+            *controller.master_mac.lock() = local;
+            let mut sighting = rec(mac, local);
+            sighting.rx_type = initial_rx;
+            let merge = |sighting: &DiscoveredDevice| {
+                merge_sightings(
+                    std::slice::from_ref(sighting),
+                    &controller.device_health,
+                    &controller.discovered_devices,
+                    &controller.master_mac,
+                );
+            };
+            merge(&sighting);
+            assert!(controller.rebind_candidates().is_empty());
+            assert_eq!(
+                controller.device_by_mac(&mac).unwrap().rx_type,
+                if initial_rx == 1 { 1 } else { 0 }
+            );
+            sighting.rx_type = 41;
+            merge(&sighting);
+            assert!(controller.rebind_candidates().is_empty());
+            merge(&sighting);
+            if initial_rx == 1 {
+                assert!(controller.rebind_candidates().is_empty());
+                merge(&sighting);
+            }
+            assert_eq!(controller.rebind_candidates(), vec![mac]);
+            assert!(controller.unbound_devices().is_empty());
+
+            sighting.rx_type = 2;
+            merge(&sighting);
+            assert!(controller.rebind_candidates().is_empty());
+            merge(&sighting);
+            merge(&sighting);
+            assert_eq!(controller.device_by_mac(&mac).unwrap().rx_type, 2);
+        }
+    }
 
     #[test]
     fn lcd_group_count_uses_each_reported_slot_and_rejects_unknown_data() {
@@ -895,15 +989,66 @@ mod tests {
     fn parse_rejects_only_zero_mac() {
         let mut buf = [0u8; 42];
         buf[41] = 0x1C;
+        buf[12] = 8; // a valid channel throughout; channel 0 is rejected separately
         assert!(parse_device_record(&buf, 0).is_none());
         buf[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
-        assert!(parse_device_record(&buf, 0).is_some());
-        buf[12] = 8;
         assert!(parse_device_record(&buf, 0).is_some());
         buf[13] = 15;
         assert!(parse_device_record(&buf, 0).is_some());
         buf[13] = 1;
         assert!(parse_device_record(&buf, 0).is_some());
+    }
+
+    /// An RX slot outside the allocatable range must never be adopted.
+    ///
+    /// The master-clock broadcast writes `cpu_temp` into `rf_data[14]`, the
+    /// byte targeted frames use for `rx_type`, so devices report slots that
+    /// track CPU temperature. Adopting one addresses the device where it was
+    /// never bound, and two chains on the same broadcast collide on the same
+    /// slot.
+    #[test]
+    fn out_of_range_rx_is_not_adopted() {
+        assert!(is_valid_rx(1));
+        assert!(is_valid_rx(13));
+        assert!(!is_valid_rx(0));
+        assert!(!is_valid_rx(RX_SLOT_LIMIT));
+        // The values actually observed on hardware, all CPU temperatures.
+        for observed in [40u8, 41, 42, 44, 49, 61, 62, 64, 67, 71] {
+            assert!(!is_valid_rx(observed), "rx={observed} must be rejected");
+        }
+    }
+
+    /// A failed or partial read surfaces as channel 0. It must be rejected at
+    /// the parse boundary, not merely excluded from channel correction.
+    ///
+    /// merge_sightings() feeds every parsed record into
+    /// commit_streak(addr_cand, (channel, rx_type)). These records arrive in
+    /// bursts well over DEBOUNCE_SIGHTINGS carrying a consistent bogus rx, so
+    /// without this the burst commits that rx into published.rx_type and every
+    /// subsequent frame addresses the device with it.
+    #[test]
+    fn parse_rejects_channel_zero() {
+        let mut buf = [0u8; 42];
+        buf[41] = 0x1C;
+        buf[0..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        // Channel 0 with an otherwise plausible record, including the
+        // out-of-range rx values observed in the wild (valid slots are 1-13).
+        for bogus_rx in [0u8, 1, 41, 67] {
+            buf[12] = 0;
+            buf[13] = bogus_rx;
+            assert!(
+                parse_device_record(&buf, 0).is_none(),
+                "channel 0 with rx={bogus_rx} must be rejected"
+            );
+        }
+
+        // The same record on a valid channel is accepted.
+        buf[12] = 8;
+        buf[13] = 41;
+        let rec = parse_device_record(&buf, 0).expect("valid channel must parse");
+        assert_eq!(rec.channel, 8);
+        assert_eq!(rec.rx_type, 41);
     }
 
     #[test]

@@ -43,14 +43,8 @@ impl WirelessController {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             ))?;
 
-        let slot_index = devices
-            .iter()
-            .filter(|d| (d.bind_intent || d.master_mac == master_mac) && d.device_type != 0xFF)
-            .position(|d| d.mac == *mac)
-            .map(|i| (i + 1) as u8)
-            .unwrap_or(1);
-
         drop(devices);
+        let slot_index = self.next_slot_index(&device);
 
         let pwm = prepare_pwm(fan_pwm, &device)?;
 
@@ -154,6 +148,7 @@ fn build_pwm_packet(
     data[8..14].copy_from_slice(master_mac);
     data[14] = device.rx_type;
     data[15] = channel;
+    // The vendor's sensor-group index is separate from the RF address.
     data[16] = slot;
     data[17..21].copy_from_slice(&pwm);
     data
@@ -182,6 +177,7 @@ mod tests {
     fn device(fan_type: WirelessFanType) -> DiscoveredDevice {
         let mut record = [0; 42];
         record[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        record[12] = 8; // a real record always carries a valid RF channel
         record[13] = 2;
         record[19] = 3;
         record[41] = 0x1c;

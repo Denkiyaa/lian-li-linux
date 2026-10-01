@@ -12,13 +12,17 @@ use super::{
 use anyhow::{bail, Context, Result};
 use lianli_transport::usb::{RusbBulk, USB_TIMEOUT};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 const TX_FAILURE_THRESHOLD: u32 = 5;
+
+/// How many master-clock init frames to send before switching to steady state.
+/// L-Connect3 sends three; sending one leaves a single chance over a lossy link.
+const CLOCK_INIT_FRAMES: u8 = 3;
 
 struct RuntimeClaim(Arc<AtomicBool>);
 
@@ -52,7 +56,7 @@ pub struct WirelessController {
     pub(super) discovered_devices: Arc<Mutex<Vec<DiscoveredDevice>>>,
     pub(super) device_health: DeviceHealthMap,
     pub(super) master_entries: MasterEntryMap,
-    pub(super) clock_init_sent: Arc<AtomicBool>,
+    pub(super) clock_init_count: Arc<AtomicU8>,
     pub(super) tx_failures: Arc<AtomicU32>,
     pub(super) desired_effects: Arc<Mutex<std::collections::HashMap<[u8; 6], [u8; 4]>>>,
     pub(super) mb_rgb_targets: MbRgbTargetMap,
@@ -83,7 +87,7 @@ impl Clone for WirelessController {
             discovered_devices: Arc::clone(&self.discovered_devices),
             device_health: Arc::clone(&self.device_health),
             master_entries: Arc::clone(&self.master_entries),
-            clock_init_sent: Arc::clone(&self.clock_init_sent),
+            clock_init_count: Arc::clone(&self.clock_init_count),
             tx_failures: Arc::clone(&self.tx_failures),
             desired_effects: Arc::clone(&self.desired_effects),
             mb_rgb_targets: Arc::clone(&self.mb_rgb_targets),
@@ -116,7 +120,7 @@ impl WirelessController {
             discovered_devices: Arc::new(Mutex::new(Vec::new())),
             device_health: Arc::new(Mutex::new(Default::default())),
             master_entries: Arc::new(Mutex::new(Default::default())),
-            clock_init_sent: Arc::new(AtomicBool::new(false)),
+            clock_init_count: Arc::new(AtomicU8::new(0)),
             tx_failures: Arc::new(AtomicU32::new(0)),
             desired_effects: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mb_rgb_targets: Arc::new(Mutex::new(Default::default())),
@@ -287,7 +291,7 @@ impl WirelessController {
         thread::sleep(Duration::from_millis(500));
 
         self.video_mode_active.store(false, Ordering::Release);
-        self.clock_init_sent.store(false, Ordering::Release);
+        self.clock_init_count.store(0, Ordering::Release);
 
         let stop_flag = self.poll_stop.clone();
         let discovered_devices = Arc::clone(&self.discovered_devices);
@@ -457,7 +461,21 @@ impl WirelessController {
         rf_data[0] = RF_SELECT;
         rf_data[1] = super::RF_CLOCK_SYNC;
         rf_data[8..14].copy_from_slice(&master_mac);
-        let init = !self.clock_init_sent.load(Ordering::Acquire);
+        // The vendor sends the init frame three times; this daemon sent it once.
+        //
+        // The init frame is the one that fills rf_data[14..64] with the 0x14
+        // "unset" sentinel rather than sensor data. rf_data[14] is also the
+        // offset targeted frames use for rx_type, and build_payload() puts
+        // cpu_temp at payload[0], so every steady-state broadcast carries a
+        // temperature in that field. Devices that never saw the sentinel appear
+        // to treat it as live: measured on this hardware, 11 of 12 unexplained
+        // rx changes matched the CPU temperature being broadcast at the time,
+        // and two chains latching the same temperature collide on one slot.
+        //
+        // Over a lossy RF link one attempt is one chance. L-Connect3 sends three
+        // (observed in capture); match that.
+        let sent = self.clock_init_count.load(Ordering::Acquire);
+        let init = sent < CLOCK_INIT_FRAMES;
         if init {
             // vendor init frame: fixedData region carries the 0x14 "unset" sentinel
             rf_data[14..64].fill(0x14);
@@ -486,7 +504,7 @@ impl WirelessController {
             Ok(())
         })?;
         if init {
-            self.clock_init_sent.store(true, Ordering::Release);
+            self.clock_init_count.fetch_add(1, Ordering::Release);
         }
         Ok(())
     }
@@ -635,6 +653,17 @@ impl WirelessController {
             })
     }
 
+    /// Whether the user explicitly unbound this device and it has not been
+    /// bound again since. `unbound_devices()` does not check this - a manual
+    /// "bind all" is meant to override it - but automatic recovery must not,
+    /// or it silently rebinds a device the user deliberately left detached.
+    pub fn is_manually_unbound(&self, mac: &[u8; 6]) -> bool {
+        self.device_health
+            .lock()
+            .get(mac)
+            .is_some_and(|h| h.man_unbind)
+    }
+
     /// Snapshot of devices available for binding (observed foreign, no intent).
     pub fn unbound_devices(&self) -> Vec<DiscoveredDevice> {
         let local_mac = *self.master_mac.lock();
@@ -646,23 +675,27 @@ impl WirelessController {
             .collect()
     }
 
-    /// Recovery requires ownership confirmed in this runtime and sustained loss of that ownership.
+    /// The caller must restrict recovery to configured devices.
     pub fn rebind_candidates(&self) -> Vec<[u8; 6]> {
+        let local = *self.master_mac.lock();
+        if local == [0; 6] {
+            return Vec::new();
+        }
         self.device_health
             .lock()
             .iter()
             .filter(|(_, h)| {
-                if h.dead
-                    || h.man_unbind
-                    || !h.bind_intent
-                    || h.observed_master != [0u8; 6]
-                    || h.raw_master != [0u8; 6]
-                    || h.raw_seen.elapsed() > ACK_FRESHNESS
-                {
+                if h.dead || h.man_unbind || h.raw_seen.elapsed() > ACK_FRESHNESS {
                     return false;
                 }
-                h.foreign_since
-                    .is_some_and(|t| t.elapsed() >= REBIND_FOREIGN_AFTER)
+                if h.observed_master == local && h.raw_master == local {
+                    return h.bind_intent && h.confirmed_invalid_rx == Some(h.raw_rx);
+                }
+                h.observed_master == [0; 6]
+                    && h.raw_master == [0; 6]
+                    && (!h.bind_intent
+                        || h.foreign_since
+                            .is_some_and(|t| t.elapsed() >= REBIND_FOREIGN_AFTER))
             })
             .map(|(mac, _)| *mac)
             .collect()
@@ -677,7 +710,10 @@ impl WirelessController {
         h.observed_master = h.raw_master;
         h.published.bind_intent = intent;
         h.published.master_mac = h.raw_master;
-        h.published.rx_type = h.raw_rx;
+        if !intent || super::discovery::is_valid_rx(h.raw_rx) {
+            h.published.rx_type = h.raw_rx;
+        }
+        h.confirmed_invalid_rx = None;
         h.published.channel = h.raw_channel;
         if let Some(device) = self
             .discovered_devices
@@ -832,6 +868,24 @@ impl WirelessController {
         device: &DiscoveredDevice,
         rf_data: &[u8],
     ) -> Result<()> {
+        self.send_rf_packet_addressed(handle, device.channel, device.rx_type, rf_data)
+    }
+
+    /// Send an RF frame with an explicit RX target in the USB header.
+    ///
+    /// `rx_target` is the slot the dongle addresses the frame to; `0xFF`
+    /// broadcasts to every device, leaving the destination MAC inside the frame
+    /// to select the recipient. Recovery paths need this: a device that latched
+    /// an out-of-range slot is not listening on the slot we have published for
+    /// it, and the guard that withholds a slot publishes `0` - so a frame
+    /// addressed from the published value reaches nothing at all.
+    pub(super) fn send_rf_packet_addressed(
+        &self,
+        handle: &RusbBulk,
+        channel: u8,
+        rx_target: u8,
+        rf_data: &[u8],
+    ) -> Result<()> {
         anyhow::ensure!(
             rf_data.len() == RF_DATA_SIZE,
             "invalid RGB RF packet length"
@@ -840,8 +894,8 @@ impl WirelessController {
             let mut packet = [0u8; 64];
             packet[0] = USB_CMD_SEND_RF;
             packet[1] = chunk_idx;
-            packet[2] = device.channel;
-            packet[3] = device.rx_type;
+            packet[2] = channel;
+            packet[3] = rx_target;
 
             let start = chunk_idx as usize * RF_CHUNK_SIZE;
             let end = start + RF_CHUNK_SIZE;
@@ -973,7 +1027,9 @@ mod tests {
         let mut owner = WirelessController::new();
         owner.runtime_claim = Some(RuntimeClaim::acquire(&owner.runtime_claimed).unwrap());
         owner.poll_stop.store(true, Ordering::Release);
-        owner.clock_init_sent.store(true, Ordering::Release);
+        owner
+            .clock_init_count
+            .store(CLOCK_INIT_FRAMES, Ordering::Release);
         let mut clone = owner.clone();
 
         assert!(clone
@@ -989,7 +1045,7 @@ mod tests {
         drop(clone);
         assert!(owner.runtime_claimed.load(Ordering::Acquire));
         assert!(owner.poll_stop.load(Ordering::Acquire));
-        assert!(owner.clock_init_sent.load(Ordering::Acquire));
+        assert!(owner.clock_init_count.load(Ordering::Acquire) >= CLOCK_INIT_FRAMES);
     }
 
     #[test]
@@ -1251,6 +1307,32 @@ mod tests {
     }
 
     #[test]
+    fn invalid_rx_recovery_rejects_stale_foreign_dead_and_manually_unbound_devices() {
+        let mut healthy = entry([9; 6]);
+        healthy.bind_intent = true;
+        healthy.raw_rx = 41;
+        healthy.confirmed_invalid_rx = Some(41);
+        let c = controller_with_health(vec![(mac(), healthy)]);
+        assert_eq!(c.rebind_candidates(), vec![mac()]);
+        for blocked in 0..5 {
+            {
+                let mut health = c.device_health.lock();
+                let h = health.get_mut(&mac()).unwrap();
+                h.man_unbind = blocked == 0;
+                h.dead = blocked == 1;
+                h.raw_master = if blocked == 2 { [7; 6] } else { [9; 6] };
+                h.observed_master = if blocked == 3 { [7; 6] } else { [9; 6] };
+                h.raw_seen = if blocked == 4 {
+                    Instant::now() - ACK_FRESHNESS - Duration::from_secs(1)
+                } else {
+                    Instant::now()
+                };
+            }
+            assert!(c.rebind_candidates().is_empty(), "blocked case {blocked}");
+        }
+    }
+
+    #[test]
     fn masterless_intent_needs_timer() {
         let mut h = entry([0u8; 6]);
         h.bind_intent = true;
@@ -1270,15 +1352,15 @@ mod tests {
     }
 
     #[test]
-    fn masterless_at_startup_is_not_automatically_claimed() {
+    fn masterless_at_startup_is_available_for_configured_recovery() {
         let c = controller_with_health(vec![(mac(), entry([0u8; 6]))]);
-        assert!(c.rebind_candidates().is_empty());
+        assert_eq!(c.rebind_candidates(), vec![mac()]);
         c.device_health
             .lock()
             .get_mut(&mac())
             .unwrap()
             .foreign_since = Some(Instant::now() - REBIND_FOREIGN_AFTER - Duration::from_secs(1));
-        assert!(c.rebind_candidates().is_empty());
+        assert_eq!(c.rebind_candidates(), vec![mac()]);
     }
 
     #[test]
@@ -1321,6 +1403,16 @@ mod tests {
             ([4, 2, 3, 4, 5, 6], healthy),
         ]);
         assert!(c.rebind_candidates().is_empty());
+    }
+
+    #[test]
+    fn is_manually_unbound_reads_man_unbind() {
+        let mut unbound = entry([0u8; 6]);
+        unbound.man_unbind = true;
+        let c = controller_with_health(vec![(mac(), unbound), ([9u8; 6], entry([0u8; 6]))]);
+        assert!(c.is_manually_unbound(&mac()));
+        assert!(!c.is_manually_unbound(&[9u8; 6]));
+        assert!(!c.is_manually_unbound(&[8, 8, 8, 8, 8, 8]));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::controller::WirelessController;
-use super::discovery::poll_and_discover;
+use super::discovery::{poll_and_discover, DiscoveredDevice, RX_SLOT_LIMIT};
 use super::{
     WirelessFanType, RF_CHUNKS, RF_CHUNK_SIZE, RF_DATA_SIZE, RF_PWM_CMD, RF_SELECT, USB_CMD_SEND_RF,
 };
@@ -14,7 +14,7 @@ impl WirelessController {
         let _binding = self.begin_binding(mac)?;
         self.check_bind_allowed(mac)?;
         let master_mac = *self.master_mac.lock();
-        let new_rx = self.get_rx_unused();
+        let new_rx = self.get_rx_unused()?;
         self.converge_bind_state(mac, &master_mac, new_rx)?;
         self.confirm_binding(mac, true);
         self.save_rf_config()
@@ -207,19 +207,12 @@ impl WirelessController {
             self.next_slot_index(&device)
         };
 
-        let mut rf_data = vec![0u8; RF_DATA_SIZE];
-        rf_data[0] = RF_SELECT;
-        rf_data[1] = RF_PWM_CMD;
-        rf_data[2..8].copy_from_slice(&device.mac);
-        rf_data[8..14].copy_from_slice(target_master_mac);
-        rf_data[14] = target_rx;
-        rf_data[15] = master_ch;
-        rf_data[16] = slot;
-        rf_data[17..21].copy_from_slice(&device.current_pwm);
+        let rf_data = build_bind_packet(&device, target_master_mac, target_rx, master_ch, slot);
 
         self.tx_recover(|handle| {
             for _ in 0..6 {
-                self.send_rf_packet(handle, &device, &rf_data)?;
+                // Recovery cannot rely on the old RX slot. The payload MAC selects the device.
+                self.send_rf_packet_addressed(handle, device.channel, 0xFF, &rf_data)?;
                 thread::sleep(Duration::from_millis(30));
             }
             Ok(())
@@ -238,18 +231,18 @@ impl WirelessController {
         Ok(())
     }
 
-    /// Find an unused RX endpoint (1-14) for a new device binding.
-    fn get_rx_unused(&self) -> u8 {
+    // Reserve both observed and published slots while recovery is pending.
+    fn get_rx_unused(&self) -> Result<u8> {
         let health = self.device_health.lock();
-        for rx in 1..14u8 {
+        for rx in 1..RX_SLOT_LIMIT {
             let in_use = health
                 .values()
-                .any(|h| h.bind_intent && !h.dead && h.raw_rx == rx);
+                .any(|h| h.bind_intent && !h.dead && (h.raw_rx == rx || h.published.rx_type == rx));
             if !in_use {
-                return rx;
+                return Ok(rx);
             }
         }
-        1
+        bail!("no free RX slot: all slots on this dongle are in use")
     }
 
     pub(super) fn save_rf_config(&self) -> Result<()> {
@@ -283,6 +276,25 @@ impl WirelessController {
             Ok(())
         })
     }
+}
+
+fn build_bind_packet(
+    device: &DiscoveredDevice,
+    master: &[u8; 6],
+    rx: u8,
+    channel: u8,
+    slot: u8,
+) -> Vec<u8> {
+    let mut data = vec![0; RF_DATA_SIZE];
+    data[0] = RF_SELECT;
+    data[1] = RF_PWM_CMD;
+    data[2..8].copy_from_slice(&device.mac);
+    data[8..14].copy_from_slice(master);
+    data[14] = rx;
+    data[15] = channel;
+    data[16] = slot;
+    data[17..21].copy_from_slice(&device.current_pwm);
+    data
 }
 
 struct BindingGuard(std::sync::Arc<parking_lot::Mutex<Option<[u8; 6]>>>);
@@ -343,6 +355,40 @@ mod tests {
     }
 
     #[test]
+    fn bind_packet_preserves_separate_rx_and_sensor_group_index() {
+        let c = controller_with([9; 6], false);
+        let mac = [1, 2, 3, 4, 5, 6];
+        seed_device(&c, &mac, [9; 6], true);
+        let mut device = c.device_health.lock()[&mac].published.clone();
+        device.current_pwm = [100, 150, 200, 0];
+        let data = build_bind_packet(&device, &[9; 6], 7, 8, 2);
+        assert_eq!(
+            &data[..21],
+            &[0x12, 0x10, 1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9, 7, 8, 2, 100, 150, 200, 0]
+        );
+        assert_eq!(data.len(), RF_DATA_SIZE);
+        assert!(data[21..].iter().all(|byte| *byte == 0));
+        let unbind = build_bind_packet(&device, &[0; 6], 0, 8, 0);
+        assert_eq!(&unbind[8..17], &[0, 0, 0, 0, 0, 0, 0, 8, 0]);
+    }
+
+    #[test]
+    fn rx_allocation_fails_when_every_slot_is_reserved() {
+        let c = controller_with([9; 6], false);
+        for rx in 1..RX_SLOT_LIMIT {
+            let mac = [rx; 6];
+            seed_device(&c, &mac, [9; 6], true);
+            c.device_health
+                .lock()
+                .get_mut(&mac)
+                .unwrap()
+                .published
+                .rx_type = rx;
+        }
+        assert!(c.get_rx_unused().is_err());
+    }
+
+    #[test]
     fn pending_binding_is_exclusive_and_released_on_failure() {
         let c = controller_with([9; 6], false);
         let mac = [1, 2, 3, 4, 5, 6];
@@ -352,6 +398,17 @@ mod tests {
         drop(binding);
         assert!(c.bind_device(&mac).is_err());
         assert!(c.binding_mac.lock().is_none());
+    }
+
+    #[test]
+    fn get_rx_unused_skips_a_slot_still_live_via_published_rx_type() {
+        let c = controller_with([9u8; 6], false);
+        seed_device(&c, &[1, 2, 3, 4, 5, 6], [9u8; 6], true);
+        assert_eq!(
+            c.get_rx_unused().unwrap(),
+            2,
+            "slot 1 is still live via published.rx_type even though raw_rx disagrees"
+        );
     }
 
     #[test]
@@ -367,6 +424,7 @@ mod tests {
         drop(health);
         c.confirm_binding(&mac, false);
         assert!(c.devices().is_empty());
+        assert_eq!(c.discovered_devices.lock()[0].rx_type, 0);
         assert_eq!(c.unbound_devices().len(), 1);
         assert!(c.rebind_candidates().is_empty());
     }
