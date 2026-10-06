@@ -200,9 +200,9 @@ async function applyChanges() {
   applying.value = true;
   try {
     await config.save();
-    message.success("Applied to the LCD");
+    message.success("Saved and sent to the LCD");
   } catch (error) {
-    message.error(`Apply failed: ${error instanceof Error ? error.message : String(error)}`, { duration: 10000 });
+    message.error(`Save failed: ${error instanceof Error ? error.message : String(error)}`, { duration: 10000 });
   } finally {
     applying.value = false;
   }
@@ -623,9 +623,9 @@ async function handleStopClean() {
             type="primary"
             :loading="applying"
             :disabled="!daemon.canWrite || settingsLocked"
-            title="Save all pending changes and send them to the LCD"
+            title="Saves every pending change in the app, including other pages, and sends this LCD its new settings"
             @click="applyChanges"
-          >Apply</n-button>
+          >Save all</n-button>
         </template>
         <StartupImageDialog v-if="selectedDevice?.startup_image" :device="selectedDevice" />
         <n-button
@@ -800,7 +800,7 @@ async function handleStopClean() {
         <div
           class="preview-frame"
           :class="{ pannable: isFileMedia && !!mediaPreviewUrl }"
-          :style="{ aspectRatio: previewAspect }"
+          :style="{ aspectRatio: previewAspect, '--preview-brightness': brightness / 100 }"
           @pointerdown="onPreviewPointerDown"
           @pointermove="onPreviewPointerMove"
           @pointerup="onPreviewPointerUp"
@@ -844,7 +844,7 @@ async function handleStopClean() {
         <label class="muted">Template</label>
         <!-- Preview thumbnail + dropdown/buttons on the same row (mirrors Slint). -->
         <div class="template-row">
-          <div class="template-preview">
+          <div class="template-preview" :style="{ '--preview-brightness': brightness / 100 }">
             <img v-if="previewJpeg" :src="`data:image/jpeg;base64,${previewJpeg}`" alt="template preview" />
             <div v-else class="preview-ph muted">{{ previewLoading ? "…" : "—" }}</div>
           </div>
@@ -1023,6 +1023,9 @@ async function handleStopClean() {
 .preview-frame.pannable:active {
   cursor: grabbing;
 }
+.preview-frame > * {
+  filter: brightness(var(--preview-brightness, 1));
+}
 .preview-frame {
   position: relative;
   width: 100%;
@@ -1093,6 +1096,7 @@ async function handleStopClean() {
   justify-content: center;
 }
 .template-preview img {
+  filter: brightness(var(--preview-brightness, 1));
   width: 100%;
   height: 100%;
   object-fit: contain;
