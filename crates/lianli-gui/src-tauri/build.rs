@@ -27,7 +27,10 @@ const INSTALL_STAMP: &str = "node_modules/.lianli-npm-ci";
 fn install_dependencies(npm: &Path, root: &Path) {
     let expected = dependency_fingerprint(root);
     let stamp = root.join(INSTALL_STAMP);
-    if expected.is_some() && fs::read_to_string(&stamp).ok() == expected {
+    if expected.is_some()
+        && root.join("node_modules/.package-lock.json").is_file()
+        && fs::read_to_string(&stamp).ok() == expected
+    {
         return;
     }
     let _ = fs::remove_file(&stamp);

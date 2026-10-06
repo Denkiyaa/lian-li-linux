@@ -24,6 +24,10 @@ const accessIssues = ref(false);
 const importActive = ref(false);
 const copiesOpen = ref(false);
 const showCopies = computed(() => accessIssues.value || importActive.value || copiesOpen.value);
+function onImportProgress(active: boolean) {
+  if (importActive.value && !active) copiesOpen.value = true;
+  importActive.value = active;
+}
 
 const selectedRaw = ref(0);
 const selected = computed(() => Math.min(selectedRaw.value, Math.max(0, entries.value.length - 1)));
@@ -91,7 +95,7 @@ function addLcd() {
       v-show="showCopies"
       :lcds="entries"
       :templates="selectedTemplates"
-      @in-progress="(v) => importActive = v"
+      @in-progress="onImportProgress"
     />
 
     <div v-for="device in wirelessImageDevices" :key="device.device_id" class="card wireless-row">

@@ -140,9 +140,7 @@ impl SensorAsset {
         let ranges = ranges.into_iter().map(|r| (r.max, r.color)).collect();
 
         let source = match &descriptor.source {
-            SensorSourceConfig::Constant { value } => {
-                SensorSource::Constant(value.clamp(0.0, 100.0))
-            }
+            SensorSourceConfig::Constant { value } => SensorSource::Constant(*value),
             SensorSourceConfig::Command { .. }
             | SensorSourceConfig::Hwmon { .. }
             | SensorSourceConfig::NvidiaGpu { .. }
@@ -438,14 +436,17 @@ mod tests {
     use super::*;
 
     fn asset_reading(value: f32) -> SensorAsset {
+        let configured = if value.is_finite() { value } else { 0.0 };
         let descriptor = serde_json::from_value(serde_json::json!({
-            "label": "RAM Used", "unit": "GB", "source": {"type": "constant", "value": 0.0}
+            "label": "RAM Used", "unit": "GB", "source": {"type": "constant", "value": configured}
         }))
         .unwrap();
         let asset =
             SensorAsset::new(&descriptor, 0.0, &ScreenInfo::TLLCD, &[], None, 1000).unwrap();
         let mut asset = Arc::try_unwrap(asset).unwrap();
-        asset.source = SensorSource::Constant(value);
+        if !value.is_finite() {
+            asset.source = SensorSource::Constant(value);
+        }
         asset
     }
 

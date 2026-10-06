@@ -8,6 +8,7 @@ import { useFansStore } from "@/stores/fans";
 import { useLcdStore } from "@/stores/lcd";
 import { useAioStore } from "@/stores/aio";
 import { useConfigStore } from "@/stores/config";
+import { useDaemonStore } from "@/stores/daemon";
 import { useIpc } from "@/composables/useIpc";
 import { fanQuantityKey, fanQuantityPort, stageFanQuantity } from "@/utils/fanQuantity";
 import {
@@ -24,6 +25,7 @@ const fans = useFansStore();
 const lcd = useLcdStore();
 const aio = useAioStore();
 const config = useConfigStore();
+const daemon = useDaemonStore();
 const dialog = useDialog();
 const ipc = useIpc();
 
@@ -153,8 +155,7 @@ async function onUnbind() {
 }
 
 async function refreshSoon() {
-  const { useDaemonStore } = await import("@/stores/daemon");
-  await useDaemonStore().refresh();
+  await daemon.refresh();
 }
 
 const primaryIcon = computed(() => {
@@ -182,6 +183,7 @@ const subtitle = computed(() =>
 
 type StatusTone = "success" | "warning" | "danger" | "muted" | "info";
 const status = computed<{ label: string; tone: StatusTone; busy?: boolean }>(() => {
+  if (!daemon.connected) return { label: "Offline", tone: "muted" };
   switch (pending.value) {
     case "switch": return { label: "Switching…", tone: "warning", busy: true };
     case "bind": return { label: "Binding…", tone: "warning", busy: true };
@@ -408,6 +410,7 @@ async function ping() {
 }
 .actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-2);
@@ -443,7 +446,7 @@ async function ping() {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
-@media (max-width: 820px) {
+@container (max-width: 760px) {
   .device-row {
     grid-template-columns: 36px minmax(0, 1fr) auto;
   }

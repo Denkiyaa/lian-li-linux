@@ -57,7 +57,7 @@ function iconFor(name: string) {
         <span class="dot" />
         {{ daemon.connected ? "Connected" : "Offline" }}
       </div>
-      <div class="device-count">{{ devices.summary }}</div>
+      <div class="device-count">{{ daemon.connected ? devices.summary : `Last seen: ${devices.summary}` }}</div>
     </div>
   </aside>
 </template>
