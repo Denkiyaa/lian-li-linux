@@ -1,5 +1,6 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
@@ -19,7 +20,11 @@ pub fn read(path: &Path) -> Result<Vec<u8>, String> {
     if !PREVIEW_EXTENSIONS.contains(&extension.as_str()) {
         return Err("This file type cannot be previewed".into());
     }
-    let file = File::open(path).map_err(|error| format!("Cannot open media: {error}"))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("Cannot open media: {error}"))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("Cannot inspect media: {error}"))?;
@@ -62,5 +67,18 @@ mod tests {
         let folder = directory.path().join("folder.png");
         std::fs::create_dir(&folder).unwrap();
         assert!(read(&folder).is_err());
+    }
+
+    #[test]
+    fn fifo_paths_are_rejected_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("pipe.gif");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(read(&fifo).is_err()).unwrap());
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reading a FIFO blocked"));
     }
 }
