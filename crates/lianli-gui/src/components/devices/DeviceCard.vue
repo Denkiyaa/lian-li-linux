@@ -9,6 +9,8 @@ import { useLcdStore } from "@/stores/lcd";
 import { useAioStore } from "@/stores/aio";
 import { useConfigStore } from "@/stores/config";
 import { useDaemonStore } from "@/stores/daemon";
+import { useLcdNamesStore } from "@/stores/lcdNames";
+import { lcdDeviceLabels, lcdEntryKey, resolveLcdDevice } from "@/utils/lcdSelection";
 import { useIpc } from "@/composables/useIpc";
 import { fanQuantityKey, fanQuantityPort, stageFanQuantity } from "@/utils/fanQuantity";
 import {
@@ -26,6 +28,7 @@ const lcd = useLcdStore();
 const aio = useAioStore();
 const config = useConfigStore();
 const daemon = useDaemonStore();
+const lcdNames = useLcdNamesStore();
 const dialog = useDialog();
 const ipc = useIpc();
 
@@ -165,9 +168,20 @@ const primaryIcon = computed(() => {
   return Palette;
 });
 
+const title = computed(() =>
+  caps.value.lcd ? lcdDeviceLabels(devices.lcdDevices).get(d.value.device_id) ?? d.value.name : d.value.name,
+);
+const lcdName = computed(() => {
+  const entry = config.config.lcds.find(
+    (candidate) => resolveLcdDevice(candidate, devices.lcdDevices)?.device_id === d.value.device_id,
+  );
+  return entry ? lcdNames.names[lcdEntryKey(entry)] ?? "" : "";
+});
 const role = computed(() => {
   if (caps.value.fan && fanRpms.value.length > 1) return `Fan group · ${fanRpms.value.length} fans`;
-  if (caps.value.lcd && !caps.value.fan && !caps.value.pump) return "LCD screen";
+  if (caps.value.lcd && !caps.value.fan && !caps.value.pump) {
+    return lcdName.value ? `LCD screen · ${lcdName.value}` : "LCD screen";
+  }
   return null;
 });
 
@@ -226,7 +240,7 @@ async function ping() {
 
     <div class="identity">
       <div class="name-line">
-        <span class="name">{{ d.name }}</span>
+        <span class="name">{{ title }}</span>
         <span class="caps">
           <Monitor v-if="caps.lcd" :size="12" class="cap-lcd" title="LCD" />
           <Fan v-if="caps.fan" :size="12" class="cap-fan" title="Fan" />

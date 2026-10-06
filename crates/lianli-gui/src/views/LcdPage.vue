@@ -1,10 +1,18 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Plus, Image, Film, Palette, Gauge, LayoutTemplate, MonitorOff } from "lucide-vue-next";
+import { Plus, Image, Film, Palette, Gauge, GripVertical, LayoutTemplate, MonitorOff } from "lucide-vue-next";
 import type { LcdConfig, MediaType } from "@/types";
 import { useConfigStore } from "@/stores/config";
 import { useDevicesStore } from "@/stores/devices";
-import { resolveLcdDevice } from "@/utils/lcdSelection";
+import { useLcdNamesStore } from "@/stores/lcdNames";
+import {
+  lcdDeviceLabels,
+  lcdEntryKey,
+  loadLcdOrder,
+  orderedLcdIndices,
+  resolveLcdDevice,
+  saveLcdOrder,
+} from "@/utils/lcdSelection";
 import LcdConfigCard from "@/components/lcd/LcdConfigCard.vue";
 import MediaAccessNotice from "@/components/lcd/MediaAccessNotice.vue";
 import ManagedMediaImport from "@/components/lcd/ManagedMediaImport.vue";
@@ -48,9 +56,63 @@ function mediaMeta(entry: LcdConfig) {
   return MEDIA_META[entry.type] ?? { label: entry.type, icon: Image };
 }
 
-function deviceName(entry: LcdConfig): string | null {
-  return resolveLcdDevice(entry, devices.lcdDevices)?.name ?? null;
+const lcdNames = useLcdNamesStore();
+const labels = computed(() => lcdDeviceLabels(devices.lcdDevices));
+function deviceLabel(entry: LcdConfig): string | null {
+  const device = resolveLcdDevice(entry, devices.lcdDevices);
+  if (!device) return null;
+  return lcdNames.names[lcdEntryKey(entry)] || (labels.value.get(device.device_id) ?? device.name);
 }
+
+const order = ref(loadLcdOrder());
+const ordered = computed(() => orderedLcdIndices(entries.value, order.value));
+
+const rowElements: (HTMLElement | null)[] = [];
+function setRowRef(element: HTMLElement | null, position: number) {
+  rowElements[position] = element;
+}
+const dragFrom = ref<number | null>(null);
+const dropAt = ref<number | null>(null);
+function onDragStart(position: number, event: PointerEvent) {
+  dragFrom.value = position;
+  dropAt.value = position;
+  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+}
+function onDragMove(event: PointerEvent) {
+  if (dragFrom.value === null) return;
+  const count = ordered.value.length;
+  let target = count - 1;
+  for (let position = 0; position < count; position++) {
+    const rect = rowElements[position]?.getBoundingClientRect();
+    if (rect && event.clientY < rect.top + rect.height / 2) {
+      target = position;
+      break;
+    }
+  }
+  dropAt.value = target;
+}
+function onDragEnd() {
+  const from = dragFrom.value;
+  const to = dropAt.value;
+  dragFrom.value = null;
+  dropAt.value = null;
+  if (from === null || to === null || from === to) return;
+  const next = [...ordered.value];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  order.value = next.map((index) => lcdEntryKey(entries.value[index]));
+  saveLcdOrder(order.value);
+}
+
+const addOptions = computed(() => {
+  const configured = new Set(
+    entries.value.map((entry) => resolveLcdDevice(entry, devices.lcdDevices)?.device_id).filter(Boolean),
+  );
+  return devices.lcdDevices
+    .filter((device) => !configured.has(device.device_id))
+    .map((device) => ({ label: labels.value.get(device.device_id) ?? device.name, key: device.device_id }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+});
 
 function summary(entry: LcdConfig): string {
   switch (entry.type) {
@@ -67,11 +129,9 @@ function summary(entry: LcdConfig): string {
   }
 }
 
-function addLcd() {
-  const first = devices.lcdDevices[0];
+function addLcd(deviceId: string) {
   config.addLcd({
-    serial: first?.device_id ?? null,
-    index: first ? undefined : 0,
+    serial: deviceId,
     type: "image",
     path: null,
     fps: null,
@@ -107,26 +167,54 @@ function addLcd() {
       <aside class="card lcd-list">
         <div class="list-head">
           <span class="list-title">Screens</span>
-          <n-button size="tiny" type="primary" :disabled="!devices.lcdDevices.length" @click="addLcd">
-            <template #icon><Plus :size="13" /></template>
-            Add
-          </n-button>
+          <n-dropdown trigger="click" :options="addOptions" :disabled="!addOptions.length" @select="(key: string | number) => addLcd(String(key))">
+            <n-button
+              size="tiny"
+              type="primary"
+              :disabled="!addOptions.length"
+              :title="devices.lcdDevices.length && !addOptions.length ? 'Every connected screen is already configured' : undefined"
+            >
+              <template #icon><Plus :size="13" /></template>
+              Add
+            </n-button>
+          </n-dropdown>
         </div>
 
-        <button
-          v-for="(entry, i) in entries"
-          :key="i"
+        <div
+          v-for="(index, position) in ordered"
+          :key="lcdEntryKey(entries[index]) + ':' + index"
+          :ref="(element) => setRowRef(element as HTMLElement | null, position)"
           class="lcd-item"
-          :class="{ active: i === selected, offline: !deviceName(entry) }"
-          @click="selectedRaw = i"
+          :class="{
+            active: index === selected,
+            offline: !deviceLabel(entries[index]),
+            dragging: dragFrom === position,
+            'drop-before': dropAt === position && dragFrom !== null && dropAt < dragFrom,
+            'drop-after': dropAt === position && dragFrom !== null && dropAt > dragFrom,
+          }"
+          role="button"
+          tabindex="0"
+          @click="selectedRaw = index"
+          @keydown.enter="selectedRaw = index"
         >
-          <component :is="mediaMeta(entry).icon" :size="16" class="item-icon" />
-          <span class="item-text">
-            <span class="item-name">LCD {{ i + 1 }} · {{ mediaMeta(entry).label }}</span>
-            <span class="item-sub item-device">{{ deviceName(entry) ?? "Device offline" }}</span>
-            <span v-if="summary(entry)" class="item-sub">{{ summary(entry) }}</span>
+          <span
+            v-if="ordered.length > 1"
+            class="drag-handle"
+            title="Drag to match the order in your case"
+            @pointerdown.stop="onDragStart(position, $event)"
+            @pointermove="onDragMove"
+            @pointerup="onDragEnd"
+            @pointercancel="onDragEnd"
+            @click.stop
+          >
+            <GripVertical :size="14" />
           </span>
-        </button>
+          <component :is="mediaMeta(entries[index]).icon" :size="16" class="item-icon" />
+          <span class="item-text">
+            <span class="item-name">{{ deviceLabel(entries[index]) ?? "Screen offline" }}</span>
+            <span class="item-sub">{{ mediaMeta(entries[index]).label }}<template v-if="summary(entries[index])"> · {{ summary(entries[index]) }}</template></span>
+          </span>
+        </div>
 
         <p v-if="!devices.lcdDevices.length" class="list-empty muted">
           <MonitorOff :size="16" />
@@ -231,8 +319,32 @@ function addLcd() {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.lcd-item.offline .item-device {
+.lcd-item.offline .item-name {
   color: var(--warning);
+}
+.lcd-item.dragging {
+  opacity: 0.5;
+}
+.lcd-item.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.lcd-item.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.drag-handle {
+  flex-shrink: 0;
+  display: inline-flex;
+  margin: 1px -4px 0 -4px;
+  padding: 0 2px;
+  color: var(--text-muted);
+  cursor: grab;
+  touch-action: none;
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+.lcd-item:hover .drag-handle {
+  color: var(--text-secondary);
 }
 .list-empty {
   display: flex;

@@ -2,7 +2,7 @@
 import { computed, onUnmounted, ref, watch } from "vue";
 import { useDialog, useMessage } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";
-import { FolderOpen, Sparkles, Trash2, Info } from "lucide-vue-next";
+import { FolderOpen, Info, Pencil, Sparkles, Trash2 } from "lucide-vue-next";
 import type { DeviceInfo, LcdConfig, MediaFraming, MediaType, SensorDescriptor } from "@/types";
 import { clampFraming, defaultFraming, isDefaultFraming, MAX_ZOOM, panBy, previewPlacement } from "@/utils/mediaFraming";
 import { useConfigStore } from "@/stores/config";
@@ -11,7 +11,8 @@ import { useLcdStore } from "@/stores/lcd";
 import { useDaemonStore } from "@/stores/daemon";
 import { useIpc } from "@/composables/useIpc";
 import { useDebounce } from "@/composables/useDebounce";
-import { hasSavedLcdDevice, resolveLcdDevice } from "@/utils/lcdSelection";
+import { hasSavedLcdDevice, lcdDeviceLabels, lcdEntryKey, resolveLcdDevice } from "@/utils/lcdSelection";
+import { useLcdNamesStore } from "@/stores/lcdNames";
 import { brightnessError } from "@/utils/brightnessControl";
 import { matchesMediaFile, pickMediaFile } from "@/utils/mediaPicker";
 import SensorGaugeEditor from "@/components/lcd/SensorGaugeEditor.vue";
@@ -38,20 +39,35 @@ const message = useMessage();
 
 const lcdDevices = computed(() => devices.lcdDevices);
 
-const deviceOptions = computed(() => {
-  const sorted = [...lcdDevices.value].sort((a, b) =>
-    a.device_id.localeCompare(b.device_id),
-  );
-  const nameCounts = new Map<string, number>();
-  for (const d of sorted) nameCounts.set(d.name, (nameCounts.get(d.name) ?? 0) + 1);
-  const seen = new Map<string, number>();
-  return sorted.map((d) => {
-    const dup = (nameCounts.get(d.name) ?? 1) > 1;
-    const n = (seen.get(d.name) ?? 0) + 1;
-    seen.set(d.name, n);
-    return { label: dup ? `${d.name} #${n}` : d.name, value: d.device_id };
-  });
+const lcdNames = useLcdNamesStore();
+const deviceLabels = computed(() => lcdDeviceLabels(lcdDevices.value));
+const entryKey = computed(() => lcdEntryKey(props.entry));
+const customName = computed(() => lcdNames.names[entryKey.value] ?? "");
+const deviceLabel = computed(() => {
+  const device = deviceForEntry();
+  return device ? deviceLabels.value.get(device.device_id) ?? device.name : "";
 });
+const displayName = computed(() => customName.value || deviceLabel.value || "Screen offline");
+const renaming = ref(false);
+const nameDraft = ref("");
+function startRename() {
+  nameDraft.value = customName.value;
+  renaming.value = true;
+}
+function commitName() {
+  if (!renaming.value) return;
+  lcdNames.setName(entryKey.value, nameDraft.value);
+  renaming.value = false;
+}
+const sharesDevice = computed(() => {
+  const device = deviceForEntry();
+  if (!device) return false;
+  return config.config.lcds.filter((entry) => resolveLcdDevice(entry, lcdDevices.value)?.device_id === device.device_id).length > 1;
+});
+const needsDeviceChoice = computed(() => !deviceForEntry() || sharesDevice.value);
+const deviceOptions = computed(() =>
+  [...deviceLabels.value].map(([value, label]) => ({ label, value })),
+);
 
 function deviceForEntry(): DeviceInfo | undefined {
   return resolveLcdDevice(props.entry, lcdDevices.value);
@@ -521,7 +537,7 @@ async function openBrowser() {
 function removeEntry() {
   dialog.error({
     title: "Remove LCD entry?",
-    content: `LCD ${props.index + 1} will be removed from the configuration.`,
+    content: `${displayName.value} settings will be removed from the configuration.`,
     positiveText: "Remove",
     negativeText: "Cancel",
     onPositiveClick: () => {
@@ -614,7 +630,25 @@ async function handleStopClean() {
 <template>
   <div class="card lcd-config">
     <div class="head">
-      <span class="title">LCD {{ index + 1 }}</span>
+      <div class="title-wrap">
+        <n-input
+          v-if="renaming"
+          v-model:value="nameDraft"
+          size="small"
+          class="name-input"
+          :placeholder="deviceLabel || 'Screen name'"
+          :maxlength="40"
+          autofocus
+          @blur="commitName"
+          @keydown.enter="commitName"
+          @keydown.esc="renaming = false"
+        />
+        <template v-else>
+          <span class="title">{{ displayName }}</span>
+          <button class="rename-btn" title="Rename this screen" @click="startRename"><Pencil :size="12" /></button>
+          <span v-if="customName && deviceLabel" class="device-label">{{ deviceLabel }}</span>
+        </template>
+      </div>
       <div class="head-actions">
         <template v-if="entryChanged">
           <span class="unsaved">Unsaved changes</span>
@@ -688,17 +722,19 @@ async function handleStopClean() {
     </div>
 
     <div class="card-content" :inert="settingsLocked" :class="{ 'card-body-locked': settingsLocked }">
+      <n-alert v-if="needsDeviceChoice" type="warning" :show-icon="false" class="assign-alert">
+        <div class="field">
+          <label>{{ selectedDevice ? "Another entry also drives this screen. Pick the screen this entry belongs to." : "This screen is not connected. Assign the entry to a connected screen." }}</label>
+          <n-select
+            :value="selectedDeviceId || null"
+            :options="deviceOptions"
+            size="small"
+            placeholder="Assign to screen"
+            @update:value="onSelectDevice"
+          />
+        </div>
+      </n-alert>
       <div class="grid">
-      <div class="field">
-        <label class="muted">Device</label>
-        <n-select
-          :value="selectedDeviceId"
-          :options="deviceOptions"
-          size="small"
-          filterable
-          @update:value="onSelectDevice"
-        />
-      </div>
       <div class="field">
         <label class="muted">Media type</label>
         <n-select :value="entry.type" :options="mediaTypeOptions" size="small" @update:value="onMediaType" />
@@ -893,6 +929,39 @@ async function handleStopClean() {
 }
 .title {
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.title-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.name-input {
+  width: 220px;
+}
+.rename-btn {
+  display: inline-flex;
+  padding: 2px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.rename-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.device-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.assign-alert .field label {
+  font-size: var(--font-size-sm);
 }
 .head-actions {
   display: flex;
