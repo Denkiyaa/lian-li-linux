@@ -225,11 +225,9 @@ pub fn render_template_preview(
 
 const SENSOR_PREVIEW_MAX_EDGE: u32 = 1024;
 const SENSOR_LIST_TTL: Duration = Duration::from_secs(60);
-const SENSOR_PREVIEW_TTL: Duration = Duration::from_secs(30);
 
 struct CachedSensorPreview {
     key: String,
-    created: Instant,
     asset: Arc<SensorAsset>,
 }
 
@@ -257,7 +255,7 @@ fn sensor_preview_asset(
     let key = serde_json::to_string(&(descriptor, background, screen.width, screen.height))
         .map_err(|error| error.to_string())?;
     if let Some(cached) = SENSOR_PREVIEW.lock().as_ref() {
-        if cached.key == key && cached.created.elapsed() < SENSOR_PREVIEW_TTL {
+        if cached.key == key {
             return Ok(cached.asset.clone());
         }
     }
@@ -272,7 +270,6 @@ fn sensor_preview_asset(
     .map_err(|error| error.to_string())?;
     *SENSOR_PREVIEW.lock() = Some(CachedSensorPreview {
         key,
-        created: Instant::now(),
         asset: asset.clone(),
     });
     Ok(asset)
