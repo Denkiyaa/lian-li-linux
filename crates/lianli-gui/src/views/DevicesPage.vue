@@ -55,6 +55,7 @@ async function refresh() {
   margin-bottom: var(--space-4);
 }
 .device-list {
+  container-type: inline-size;
   padding: var(--space-1) 0;
 }
 .empty-state {

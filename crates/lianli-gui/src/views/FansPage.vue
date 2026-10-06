@@ -64,9 +64,13 @@ const assignmentGroups = computed(() => {
 const curveUsers = computed(() => {
   const name = current.value?.name;
   if (!name) return [];
-  return assignmentGroups.value.flatMap(({ device, group }) => {
-    const count = group.speeds.slice(0, device.fan_count ?? 1).filter((s: unknown) => s === name).length;
-    return count ? [`${device.name} (${count} fan${count === 1 ? "" : "s"})`] : [];
+  return fanCfg.value.speeds.flatMap((group) => {
+    const device = group.device_id ? devices.byId(group.device_id) : undefined;
+    const slots = device ? group.speeds.slice(0, device.fan_count ?? 1) : group.speeds;
+    const count = slots.filter((speed) => speed === name).length;
+    if (!count) return [];
+    if (!device) return [`${group.device_id ?? "Unknown device"} (offline)`];
+    return [`${device.name} (${count} fan${count === 1 ? "" : "s"})`];
   });
 });
 
