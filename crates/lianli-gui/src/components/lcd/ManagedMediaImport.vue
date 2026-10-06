@@ -6,6 +6,7 @@ import { useConfigStore } from "@/stores/config";
 import type { LcdConfig, LcdTemplate } from "@/types";
 
 const props = defineProps<{ lcds: LcdConfig[]; templates: LcdTemplate[] }>();
+const emit = defineEmits<{ inProgress: [active: boolean] }>();
 interface Result { import_id: string; lcds: LcdConfig[]; templates: LcdTemplate[] }
 interface Status { id: string; active: boolean; result: Result | null; error: string | null }
 const daemon = useDaemonStore();
@@ -32,6 +33,11 @@ function reset() {
   confirmed.value = false;
 }
 watch([() => daemon.connected, () => daemon.info?.instance_id], reset);
+watch(
+  () => busy.value || !!pending.value || !!status.value?.active || !!status.value?.result,
+  (active) => emit("inProgress", active),
+  { immediate: true },
+);
 onUnmounted(reset);
 
 async function check() {
