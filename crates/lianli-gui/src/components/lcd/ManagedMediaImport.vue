@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDaemonStore } from "@/stores/daemon";
 import { useConfigStore } from "@/stores/config";
 import { useDevicesStore } from "@/stores/devices";
-import { useLcdNamesStore } from "@/stores/lcdNames";
+import { useLcdScreensStore } from "@/stores/lcdScreens";
 import { lcdDeviceLabels, lcdEntryKey, resolveLcdDevice } from "@/utils/lcdSelection";
 import type { LcdConfig, LcdTemplate } from "@/types";
 
@@ -15,12 +15,12 @@ interface Status { id: string; active: boolean; result: Result | null; error: st
 const daemon = useDaemonStore();
 const config = useConfigStore();
 const devices = useDevicesStore();
-const lcdNames = useLcdNamesStore();
+const screens = useLcdScreensStore();
 
 function screenName(entry: LcdConfig): string {
   const device = resolveLcdDevice(entry, devices.lcdDevices);
   const label = device ? lcdDeviceLabels(devices.lcdDevices).get(device.device_id) ?? device.name : null;
-  return lcdNames.names[lcdEntryKey(entry)] || label || "Offline screen";
+  return screens.names[lcdEntryKey(entry)] || label || "Screen offline";
 }
 
 const incomplete = computed(() =>
@@ -32,8 +32,9 @@ const incomplete = computed(() =>
 );
 
 function readableError(message: string): string {
-  return message.replace(/LCD\[serial:([^\]]+)\]/g, (match, serial: string) => {
-    const entry = props.lcds.find((candidate) => candidate.serial?.replace(/^hid:/, "") === serial.replace(/^hid:/, ""));
+  return message.replace(/LCD\[(serial|index):([^\]]+)\]/g, (match, kind: string, id: string) => {
+    const key = kind === "serial" ? `serial:${id.replace(/^hid:/, "")}` : `index:${id}`;
+    const entry = props.lcds.find((candidate) => lcdEntryKey(candidate) === key);
     return entry ? screenName(entry) : match;
   });
 }
@@ -90,7 +91,7 @@ async function check() {
     status.value = value;
     pending.value = "";
     pendingChecks = 0;
-    error.value = value?.error ? `Previous import failed: ${value.error}` : "";
+    error.value = value?.error ? `Import failed: ${value.error}` : "";
     notice.value = value?.active ? "Copying and checking media. You can close this page while it finishes."
       : value?.result ? "Copies are ready. Review and stage them below, then Save to apply."
         : value ? "Import did not complete. Inspect the reported error before retrying." : "No import is recorded for this desktop session.";
@@ -158,7 +159,7 @@ async function stage() {
     <n-alert v-if="error" type="error">{{ readableError(error) }}</n-alert>
     <template v-if="status?.result">
       <p>{{ status.result.lcds.length }} LCD selections · {{ status.result.templates.length }} templates copied</p>
-      <ul><li v-for="(lcd, index) in status.result.lcds" :key="index">LCD {{ index + 1 }}: {{ lcd.path ?? lcd.template_id ?? lcd.type }}</li></ul>
+      <ul><li v-for="(lcd, index) in status.result.lcds" :key="index">{{ screenName(lcd) }}: {{ lcd.path ?? lcd.template_id ?? lcd.type }}</li></ul>
       <n-checkbox v-model:checked="confirmed" :disabled="busy || !!config.imported">Replace my current LCD drafts and matching templates with this copied selection.</n-checkbox>
       <n-button :disabled="busy || !confirmed || !!config.imported || !daemon.connected" @click="stage">Stage copied paths</n-button>
     </template>

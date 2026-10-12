@@ -12,7 +12,7 @@ import { useDaemonStore } from "@/stores/daemon";
 import { useIpc } from "@/composables/useIpc";
 import { useDebounce } from "@/composables/useDebounce";
 import { hasSavedLcdDevice, lcdDeviceLabels, lcdEntryKey, resolveLcdDevice } from "@/utils/lcdSelection";
-import { useLcdNamesStore } from "@/stores/lcdNames";
+import { useLcdScreensStore } from "@/stores/lcdScreens";
 import { brightnessError } from "@/utils/brightnessControl";
 import { matchesMediaFile, pickMediaFile } from "@/utils/mediaPicker";
 import SensorGaugeEditor from "@/components/lcd/SensorGaugeEditor.vue";
@@ -39,10 +39,10 @@ const message = useMessage();
 
 const lcdDevices = computed(() => devices.lcdDevices);
 
-const lcdNames = useLcdNamesStore();
+const screens = useLcdScreensStore();
 const deviceLabels = computed(() => lcdDeviceLabels(lcdDevices.value));
 const entryKey = computed(() => lcdEntryKey(props.entry));
-const customName = computed(() => lcdNames.names[entryKey.value] ?? "");
+const customName = computed(() => screens.names[entryKey.value] ?? "");
 const deviceLabel = computed(() => {
   const device = deviceForEntry();
   return device ? deviceLabels.value.get(device.device_id) ?? device.name : "";
@@ -56,7 +56,7 @@ function startRename() {
 }
 function commitName() {
   if (!renaming.value) return;
-  lcdNames.setName(entryKey.value, nameDraft.value);
+  screens.setName(entryKey.value, nameDraft.value);
   renaming.value = false;
 }
 const sharesDevice = computed(() => {
@@ -83,8 +83,10 @@ const brightnessConfigured = computed(() =>
 function onSelectDevice(id: string) {
   const d = lcdDevices.value.find((x) => x.device_id === id);
   if (!d) return;
+  const previousKey = entryKey.value;
   props.entry.serial = d.device_id;
   props.entry.index = undefined;
+  screens.carryOver(previousKey, entryKey.value);
   config.markDirty();
 }
 
@@ -537,7 +539,7 @@ async function openBrowser() {
 function removeEntry() {
   dialog.error({
     title: "Remove LCD entry?",
-    content: `${displayName.value} settings will be removed from the configuration.`,
+    content: `Settings for ${displayName.value} will be removed from the configuration.`,
     positiveText: "Remove",
     negativeText: "Cancel",
     onPositiveClick: () => {

@@ -9,7 +9,7 @@ import { useLcdStore } from "@/stores/lcd";
 import { useAioStore } from "@/stores/aio";
 import { useConfigStore } from "@/stores/config";
 import { useDaemonStore } from "@/stores/daemon";
-import { useLcdNamesStore } from "@/stores/lcdNames";
+import { useLcdScreensStore } from "@/stores/lcdScreens";
 import { lcdDeviceLabels, lcdEntryKey, resolveLcdDevice } from "@/utils/lcdSelection";
 import { useIpc } from "@/composables/useIpc";
 import { fanQuantityKey, fanQuantityPort, stageFanQuantity } from "@/utils/fanQuantity";
@@ -28,7 +28,7 @@ const lcd = useLcdStore();
 const aio = useAioStore();
 const config = useConfigStore();
 const daemon = useDaemonStore();
-const lcdNames = useLcdNamesStore();
+const screens = useLcdScreensStore();
 const dialog = useDialog();
 const ipc = useIpc();
 
@@ -175,7 +175,7 @@ const lcdName = computed(() => {
   const entry = config.config.lcds.find(
     (candidate) => resolveLcdDevice(candidate, devices.lcdDevices)?.device_id === d.value.device_id,
   );
-  return entry ? lcdNames.names[lcdEntryKey(entry)] ?? "" : "";
+  return entry ? screens.names[lcdEntryKey(entry)] ?? "" : "";
 });
 const role = computed(() => {
   if (caps.value.fan && fanRpms.value.length > 1) return `Fan group · ${fanRpms.value.length} fans`;

@@ -1,18 +1,11 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { Plus, Image, Film, Palette, Gauge, GripVertical, LayoutTemplate, MonitorOff } from "lucide-vue-next";
 import type { LcdConfig, MediaType } from "@/types";
 import { useConfigStore } from "@/stores/config";
 import { useDevicesStore } from "@/stores/devices";
-import { useLcdNamesStore } from "@/stores/lcdNames";
-import {
-  lcdDeviceLabels,
-  lcdEntryKey,
-  loadLcdOrder,
-  orderedLcdIndices,
-  resolveLcdDevice,
-  saveLcdOrder,
-} from "@/utils/lcdSelection";
+import { useLcdScreensStore } from "@/stores/lcdScreens";
+import { lcdDeviceLabels, lcdEntryKey, orderedLcdIndices, resolveLcdDevice } from "@/utils/lcdSelection";
 import LcdConfigCard from "@/components/lcd/LcdConfigCard.vue";
 import MediaAccessNotice from "@/components/lcd/MediaAccessNotice.vue";
 import ManagedMediaImport from "@/components/lcd/ManagedMediaImport.vue";
@@ -20,8 +13,10 @@ import StartupImageDialog from "@/components/lcd/StartupImageDialog.vue";
 
 const config = useConfigStore();
 const devices = useDevicesStore();
+const screens = useLcdScreensStore();
 
 const entries = computed(() => config.config.lcds);
+const ordered = computed(() => orderedLcdIndices(entries.value, screens.order));
 const wirelessImageDevices = computed(() => devices.list.filter(device => device.family === "WirelessAio" && device.startup_image));
 const selectedTemplates = computed(() => {
   const ids = new Set(entries.value.filter((entry) => entry.type === "custom").map((entry) => entry.template_id));
@@ -37,7 +32,7 @@ function onImportProgress(active: boolean) {
   importActive.value = active;
 }
 
-const selectedRaw = ref(0);
+const selectedRaw = ref(ordered.value[0] ?? 0);
 const selected = computed(() => Math.min(selectedRaw.value, Math.max(0, entries.value.length - 1)));
 const current = computed(() => entries.value[selected.value]);
 
@@ -56,16 +51,28 @@ function mediaMeta(entry: LcdConfig) {
   return MEDIA_META[entry.type] ?? { label: entry.type, icon: Image };
 }
 
-const lcdNames = useLcdNamesStore();
 const labels = computed(() => lcdDeviceLabels(devices.lcdDevices));
 function deviceLabel(entry: LcdConfig): string | null {
   const device = resolveLcdDevice(entry, devices.lcdDevices);
   if (!device) return null;
-  return lcdNames.names[lcdEntryKey(entry)] || (labels.value.get(device.device_id) ?? device.name);
+  return screens.names[lcdEntryKey(entry)] || (labels.value.get(device.device_id) ?? device.name);
 }
 
-const order = ref(loadLcdOrder());
-const ordered = computed(() => orderedLcdIndices(entries.value, order.value));
+function moveRow(from: number, to: number) {
+  if (from === to || to < 0 || to >= ordered.value.length) return;
+  const next = [...ordered.value];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  screens.setOrder(next.map((index) => lcdEntryKey(entries.value[index])));
+}
+
+async function onHandleKey(position: number, step: number) {
+  const to = position + step;
+  if (to < 0 || to >= ordered.value.length) return;
+  moveRow(position, to);
+  await nextTick();
+  rowElements[to]?.querySelector<HTMLElement>(".drag-handle")?.focus();
+}
 
 const rowElements: (HTMLElement | null)[] = [];
 function setRowRef(element: HTMLElement | null, position: number) {
@@ -96,12 +103,7 @@ function onDragEnd() {
   const to = dropAt.value;
   dragFrom.value = null;
   dropAt.value = null;
-  if (from === null || to === null || from === to) return;
-  const next = [...ordered.value];
-  const [moved] = next.splice(from, 1);
-  next.splice(to, 0, moved);
-  order.value = next.map((index) => lcdEntryKey(entries.value[index]));
-  saveLcdOrder(order.value);
+  if (from !== null && to !== null) moveRow(from, to);
 }
 
 const addOptions = computed(() => {
@@ -200,7 +202,13 @@ function addLcd(deviceId: string) {
           <span
             v-if="ordered.length > 1"
             class="drag-handle"
-            title="Drag to match the order in your case"
+            role="button"
+            tabindex="0"
+            aria-label="Reorder screen"
+            title="Drag, or use the arrow keys, to match the order in your case"
+            @keydown.up.prevent.stop="onHandleKey(position, -1)"
+            @keydown.down.prevent.stop="onHandleKey(position, 1)"
+            @keydown.enter.stop
             @pointerdown.stop="onDragStart(position, $event)"
             @pointermove="onDragMove"
             @pointerup="onDragEnd"
